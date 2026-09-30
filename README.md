@@ -1,0 +1,227 @@
+# Context-Aware Function-Level Tracing Benchmark
+
+Reproducible microservices benchmark for the thesis **"Perancangan Context-Aware Function-Level Tracing untuk Meningkatkan Observabilitas Internal pada Arsitektur Microservices dengan Pendekatan Asynchronous Event Processing"**.
+
+## Current stage: audit-ready benchmark
+
+This repository contains a small, deterministic three-service application with isolated comparison conditions:
+
+| Condition | Status | Purpose |
+| --- | --- | --- |
+| Baseline (no tracing) | implemented | Reference performance of the same application. |
+| Conventional tracing | implemented | Synchronous, inter-service/request-flow tracing. |
+| Proposed tracing | implemented | Boundary-level function events, propagated context, bounded async queue, and reconstruction worker. |
+
+The gateway's `GET /api/v1/quote?productId=sku-001&quantity=2` endpoint calls both `catalog` and `inventory`. Each service uses the architectural layers required by the proposal:
+
+```text
+HTTP handler -> service -> repository
+gateway handler -> gateway service -> HTTP client -> catalog / inventory
+```
+
+The repositories use fixed in-memory data at this stage. This is an **experimental design decision**, not a claim from the proposal: it keeps storage, cache warm-up, and network database effects from confounding the first tracing-overhead measurements. A database-backed variant can be added later as a separately documented factor.
+
+## Run
+
+Prerequisites: Docker Compose v2. The image is built from the committed
+`pnpm-lock.yaml`, so the application dependencies are fixed across reruns.
+
+```sh
+docker compose -p tracing-baseline up --build
+```
+
+Then request:
+
+```sh
+curl "http://localhost:8080/api/v1/quote?productId=sku-001&quantity=2"
+```
+
+Stop the environment with `docker compose -p tracing-baseline down`.
+
+## Methodology alignment
+
+Taken from the proposal:
+
+- controlled container environment using Docker Compose;
+- layered handlers, services, and repositories;
+- comparison of conventional and proposed tracing under the same environment;
+- measurements for latency, CPU, memory, throughput, queue drop rate, and reconstruction success rate;
+- proposed tracing will use wrapper instrumentation, request/span context, asynchronous event processing, and call-graph reconstruction.
+
+Not yet specified by the proposal and therefore treated as **experimental design decisions**:
+
+- Node.js 22, TypeScript, and Fastify;
+- product-quote domain and the gateway/catalog/inventory topology;
+- fixed in-memory repository data;
+- a third baseline condition, retained to make each tracing overhead calculation auditable;
+- workload descriptors for computational signature, structural signature, input size, and request intensity.
+
+## Workload descriptors and experiment runner
+
+`workloads/v1/` contains versioned JSON descriptors. Each pins the computational
+signature, structural signature, input size, traffic profile, exact target query,
+warm-up, duration, and in-flight cap. The application applies a profile only when
+the `profile` query parameter is present; ordinary quote requests remain the
+unprofiled base path.
+
+| Descriptor | Controlled profile | Nominal traffic |
+| --- | --- | --- |
+| `o1-shallow-low.json` | O(1), shallow | 50 RPS |
+| `ologn-moderate-mid.json` | O(log n), moderate | 200 RPS |
+| `on-complex-high.json` | O(n), complex | 800 RPS |
+
+The structural profiles are deterministic internal boundary shapes and the compute
+loops are deterministic; neither introduces random sleeps, external data, or
+database cache effects. These profiles are experimental-design decisions and may
+be revised only by adding a new descriptor/profile version, not by overwriting a
+configuration already used for results.
+
+To perform one full repeatable run after `docker compose -p tracing-baseline up -d`:
+
+```sh
+node tools/run-experiment.mjs --descriptor workloads/v1/o1-shallow-low.json --condition baseline
+```
+
+Each run creates `results/<run-id>/` containing `manifest.json` (condition,
+descriptor hash, containers, timestamps), an immutable descriptor copy,
+`http-summary.json` (throughput, HTTP statuses, generator drops, Request Latency,
+and Business Processing Time with p50/p95/p99),
+and `container-metrics.json` (one-second Docker CPU/memory samples). `results/`
+is intentionally ignored by Git so raw measurements do not get mixed with source.
+
+The runner performs a warm-up first, drains the proposed tracing pipeline, then
+captures all reported tracing values as deltas for the measurement phase. Thus
+`http-summary.json` records **Request Latency** (client request start to HTTP
+response) and **Business Processing Time** (Gateway `buildQuote` start to quote
+ready, including its downstream business calls and deterministic workload).
+`tracing-metrics.json` records the separate asynchronous path:
+events produced/enqueued/dropped/reconstructed, queue state, and reconstruction
+state. Reconstruction Success Rate uses only successful measurement requests as
+its denominator; warm-up requests are excluded.
+
+## Conventional synchronous tracing condition
+
+The conventional condition is isolated in [compose.conventional.yaml](compose.conventional.yaml), not mixed into the baseline configuration. It records only conventional HTTP request-flow spans: each server request and each gateway-to-service HTTP call. Span export is deliberately awaited on the request path. It does **not** instrument handler, service, or repository functions.
+
+Start it with a separate Compose project (first stop the baseline stack because both use port 8080):
+
+```sh
+docker compose -p tracing-baseline down
+docker compose -p tracing-conventional -f compose.yaml -f compose.conventional.yaml up --build -d
+```
+
+The normal quote endpoint remains on port `8080`. During a run, inspect collected conventional spans at `http://localhost:16686/v1/spans`; individual traces are available at `/v1/traces/<traceId>`. The collector is intentionally a separate container and is not part of the baseline condition.
+
+Run its workload with the matching project name:
+
+```sh
+node tools/run-experiment.mjs --descriptor workloads/v1/o1-shallow-low.json --condition conventional --compose-project tracing-conventional
+```
+
+## Proposed asynchronous function-level tracing condition
+
+The proposed condition is isolated in [compose.proposed.yaml](compose.proposed.yaml). It adds two containers:
+
+```text
+instrumented application functions
+  -> non-blocking HTTP submission
+  -> bounded trace-event queue (capacity 10,000)
+  -> reconstruction worker
+  -> per-request call graph
+```
+
+The wrapper creates `ENTRY` and `EXIT` events at the handler, service, and repository boundaries. `AsyncLocalStorage` carries `requestId` and the active parent span across nested calls; the gateway also propagates this context to catalog and inventory. Submitting events does not await queue admission or graph reconstruction, so neither operation blocks the business response.
+
+Start the proposed condition after stopping the preceding condition:
+
+```sh
+docker compose -p tracing-conventional down
+docker compose -p tracing-proposed -f compose.yaml -f compose.proposed.yaml up --build -d
+```
+
+The queue metrics endpoint is `http://localhost:16686/v1/metrics`; it reports accepted, dropped, queued, and dequeued events. The worker metrics endpoint is `http://localhost:16687/v1/metrics`; a reconstructed graph is available at `http://localhost:16687/v1/traces/<request-id>`. The quote response returns that request ID in the `x-trace-id` header.
+
+Run the proposed experiment using its project name:
+
+```sh
+node tools/run-experiment.mjs --descriptor workloads/v1/o1-shallow-low.json --condition proposed --compose-project tracing-proposed
+```
+
+For proposed runs, the runner additionally stores `tracing-metrics.json` with measurement-only deltas for the queue and reconstruction worker. These values provide the raw inputs for Queue Drop Rate and Reconstruction Success Rate analysis.
+
+## Automated experiment matrix
+
+Run the full automated matrix with one command:
+
+```sh
+pnpm matrix
+```
+
+It runs the conditions in this order: `baseline`, `conventional`, then `proposed`.
+Within each condition, descriptors run from low to high RPS. Before every
+workload repetition it starts a fresh isolated Compose stack and waits for health
+checks; it always stops that stack afterward. This state reset prevents an
+overloaded workload from affecting the next measurement. The default is one
+repetition, a five-second cooldown, and a maximum transport-error rate of 5%.
+
+Each invocation writes `results/<matrix-id>/` containing `matrix-manifest.json`,
+per-run raw artifacts under `runs/`, and analysis-ready `analysis.json` and
+`analysis.csv`. The flat analysis files include only valid measurements. Rejected
+runs are recorded separately in `failed-runs.csv` and the matrix manifest, with
+their error details. A run is rejected when it has no successful HTTP response or
+its transport-error rate exceeds 5%; the command continues to remaining runs,
+cleans up the relevant Compose stack, and exits non-zero.
+
+Runs are classified as follows:
+
+- `completed`: the target RPS and successful-request rate both reach at least 95%.
+- `saturated`: the application and runner completed the measurement but either
+  rate falls below 95%. These runs remain valuable stress-test results and are
+  written to `stress-test.csv`, not discarded as technical failures.
+- `failed`: a technical failure, such as an unhealthy Compose stack, Docker
+  unavailability, or a missing run artifact. These are written to
+  `failed-runs.csv`. The matrix performs one cleanup-and-retry when a Compose
+  stack fails to start before classifying the run as failed.
+
+Every row now includes `success_rate_percent`, `generator_drop_rate_percent`,
+target-rate attainment, and aggregate resource headroom. CPU headroom is based
+on Docker's reported host CPU cores; memory headroom is based on Docker's total
+memory capacity. The resource values include every container in the selected
+condition, including queue and worker containers for proposed tracing.
+
+At the end of a matrix, `charts.html` is generated automatically in the matrix
+directory. It contains line charts for request latency, success rate, successful
+requests, CPU, memory, business processing time, and reconstruction success.
+Generate it again manually when needed:
+
+```sh
+node tools/generate-charts.mjs --matrix-dir results/<matrix-id>
+```
+
+The default host endpoint is `http://127.0.0.1:8080`, avoiding Windows systems
+that resolve `localhost` to an unavailable IPv6 listener. When a request cannot
+connect, `http-summary.json` records the detailed transport error rather than
+only a counter.
+
+Examples:
+
+```sh
+# Three repetitions of all conditions and workloads.
+pnpm matrix -- --repetitions 3
+
+# A compact pilot: mixed workload only, one run per condition.
+pnpm matrix -- --descriptors mixed-complex-high --cooldown-seconds 0
+
+# Select specific conditions or descriptors.
+pnpm matrix -- --conditions baseline,proposed --descriptors o1-shallow-low,ologn-moderate-mid
+
+# Reject a run if more than 2% of observed requests have transport errors.
+pnpm matrix -- --max-transport-error-rate 0.02
+
+# Override the host endpoint when Docker uses a different published address.
+pnpm matrix -- --base-url http://127.0.0.1:8080
+```
+
+## Next implementation stages
+
+1. Add automated experiment-matrix execution and analysis-ready CSV/JSON results.

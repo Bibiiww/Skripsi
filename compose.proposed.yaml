@@ -1,0 +1,48 @@
+# Run only with compose.yaml. This is the proposed function-level tracing condition.
+services:
+  gateway:
+    environment:
+      TRACING_MODE: proposed
+      TRACE_QUEUE_URL: http://trace-event-queue:3000
+    depends_on:
+      trace-event-queue:
+        condition: service_healthy
+  catalog:
+    environment:
+      TRACING_MODE: proposed
+      TRACE_QUEUE_URL: http://trace-event-queue:3000
+    depends_on:
+      trace-event-queue:
+        condition: service_healthy
+  inventory:
+    environment:
+      TRACING_MODE: proposed
+      TRACE_QUEUE_URL: http://trace-event-queue:3000
+    depends_on:
+      trace-event-queue:
+        condition: service_healthy
+  trace-event-queue:
+    build: .
+    environment:
+      SERVICE_ROLE: trace-event-queue
+      PORT: 3000
+      TRACE_QUEUE_CAPACITY: 10000
+    ports:
+      - "16686:3000"
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://localhost:3000/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+  trace-reconstruction-worker:
+    build: .
+    environment:
+      SERVICE_ROLE: trace-reconstruction-worker
+      PORT: 3000
+      TRACE_QUEUE_URL: http://trace-event-queue:3000
+      TRACE_WORKER_POLL_INTERVAL_MS: 100
+    ports:
+      - "16687:3000"
+    depends_on:
+      trace-event-queue:
+        condition: service_healthy

@@ -1,0 +1,38 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Tracing benchmark workload descriptor",
+  "type": "object",
+  "required": ["workloadDescriptorVersion", "id", "applicationProfile", "computational", "structural", "request"],
+  "properties": {
+    "workloadDescriptorVersion": { "const": "1.0.0" },
+    "id": { "type": "string", "pattern": "^[a-z0-9-]+$" },
+    "applicationProfile": { "type": "string" },
+    "computational": {
+      "type": "object",
+      "required": ["signature", "inputSize"],
+      "properties": {
+        "signature": { "enum": ["O(1)", "O(log n)", "O(n)", "mixed"] },
+        "inputSize": { "type": "integer", "minimum": 1 }
+      }
+    },
+    "structural": {
+      "type": "object",
+      "required": ["signature", "boundaryDepth", "fanOut"],
+      "properties": {
+        "signature": { "enum": ["shallow", "moderate", "complex"] },
+        "boundaryDepth": { "type": "integer", "minimum": 1 },
+        "fanOut": { "type": "integer", "minimum": 1 }
+      }
+    },
+    "request": {
+      "type": "object",
+      "required": ["method", "path", "query", "rateRps", "durationSeconds", "warmupSeconds", "maxInFlight"],
+      "properties": {
+        "method": { "const": "GET" }, "path": { "const": "/api/v1/quote" },
+        "query": { "type": "object" }, "rateRps": { "type": "number", "exclusiveMinimum": 0 },
+        "durationSeconds": { "type": "number", "exclusiveMinimum": 0 }, "warmupSeconds": { "type": "number", "minimum": 0 },
+        "maxInFlight": { "type": "integer", "minimum": 1 }
+      }
+    }
+  }
+}

@@ -1,0 +1,8 @@
+{
+  "workloadDescriptorVersion": "1.0.0",
+  "id": "o1-shallow-low",
+  "applicationProfile": "o1-shallow-v1",
+  "computational": { "signature": "O(1)", "inputSize": 1 },
+  "structural": { "signature": "shallow", "boundaryDepth": 1, "fanOut": 1 },
+  "request": { "method": "GET", "path": "/api/v1/quote", "query": { "productId": "sku-001", "quantity": "2", "profile": "o1-shallow-v1" }, "rateRps": 50, "durationSeconds": 30, "warmupSeconds": 10, "maxInFlight": 200 }
+}

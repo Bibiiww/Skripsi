@@ -1,0 +1,8 @@
+{
+  "workloadDescriptorVersion": "1.0.0",
+  "id": "mixed-complex-high",
+  "applicationProfile": "mixed-complex-v1",
+  "computational": { "signature": "mixed", "inputSize": 2048 },
+  "structural": { "signature": "complex", "boundaryDepth": 3, "fanOut": 3 },
+  "request": { "method": "GET", "path": "/api/v1/quote", "query": { "productId": "sku-001", "quantity": "2", "profile": "mixed-complex-v1" }, "rateRps": 900, "durationSeconds": 30, "warmupSeconds": 10, "maxInFlight": 1800 }
+}

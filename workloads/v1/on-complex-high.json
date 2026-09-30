@@ -1,0 +1,8 @@
+{
+  "workloadDescriptorVersion": "1.0.0",
+  "id": "on-complex-high",
+  "applicationProfile": "on-complex-v1",
+  "computational": { "signature": "O(n)", "inputSize": 4096 },
+  "structural": { "signature": "complex", "boundaryDepth": 3, "fanOut": 2 },
+  "request": { "method": "GET", "path": "/api/v1/quote", "query": { "productId": "sku-001", "quantity": "2", "profile": "on-complex-v1" }, "rateRps": 800, "durationSeconds": 30, "warmupSeconds": 10, "maxInFlight": 1500 }
+}

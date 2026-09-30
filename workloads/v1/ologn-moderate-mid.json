@@ -1,0 +1,8 @@
+{
+  "workloadDescriptorVersion": "1.0.0",
+  "id": "ologn-moderate-mid",
+  "applicationProfile": "ologn-moderate-v1",
+  "computational": { "signature": "O(log n)", "inputSize": 1024 },
+  "structural": { "signature": "moderate", "boundaryDepth": 2, "fanOut": 2 },
+  "request": { "method": "GET", "path": "/api/v1/quote", "query": { "productId": "sku-001", "quantity": "2", "profile": "ologn-moderate-v1" }, "rateRps": 200, "durationSeconds": 30, "warmupSeconds": 10, "maxInFlight": 500 }
+}

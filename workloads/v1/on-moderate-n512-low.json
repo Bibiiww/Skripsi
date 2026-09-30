@@ -1,0 +1,8 @@
+{
+  "workloadDescriptorVersion": "1.0.0",
+  "id": "on-moderate-n512-low",
+  "applicationProfile": "custom-on-moderate-n512-v1",
+  "computational": { "signature": "O(n)", "inputSize": 512 },
+  "structural": { "signature": "moderate", "boundaryDepth": 2, "fanOut": 2 },
+  "request": { "method": "GET", "path": "/api/v1/quote", "query": { "productId": "sku-001", "quantity": "2", "compute": "O(n)", "structure": "moderate", "inputSize": "512" }, "rateRps": 50, "durationSeconds": 30, "warmupSeconds": 10, "maxInFlight": 200 }
+}

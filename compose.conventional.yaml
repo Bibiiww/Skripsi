@@ -1,0 +1,27 @@
+# Run only with compose.yaml. This override is the isolated conventional condition:
+# HTTP server/client spans are exported synchronously to the collector below.
+services:
+  gateway:
+    environment:
+      TRACING_MODE: conventional
+      TRACE_COLLECTOR_URL: http://trace-collector:3000
+  catalog:
+    environment:
+      TRACING_MODE: conventional
+      TRACE_COLLECTOR_URL: http://trace-collector:3000
+  inventory:
+    environment:
+      TRACING_MODE: conventional
+      TRACE_COLLECTOR_URL: http://trace-collector:3000
+  trace-collector:
+    build: .
+    environment:
+      SERVICE_ROLE: trace-collector
+      PORT: 3000
+    ports:
+      - "16686:3000"
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://localhost:3000/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
