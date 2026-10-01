@@ -149,6 +149,19 @@ node tools/run-experiment.mjs --descriptor workloads/v1/o1-shallow-low.json --co
 
 For proposed runs, the runner additionally stores `tracing-metrics.json` with measurement-only deltas for the queue and reconstruction worker. These values provide the raw inputs for Queue Drop Rate and Reconstruction Success Rate analysis.
 
+### Internal diagnostic observability
+
+Diagnostic instrumentation is disabled by default and does not alter tracing architecture, workload, queue capacity, worker concurrency, batch size, or the deliberately non-awaited proposed submission. To run it in PowerShell, start the selected Compose stack and benchmark in the same shell with:
+
+```powershell
+$env:INTERNAL_OBSERVABILITY = "true"
+node tools/run-experiment.mjs --descriptor workloads/v1/o1-shallow-low.json --condition proposed --compose-project tracing-proposed --internal-observability true
+```
+
+Each diagnostic run adds `latency.json`, `resource.json`, and `internal-observability.json`. The latter distinguishes request/business timing from critical-path wrapper, event-capture, JSON serialization, submission-initiation, queue admission/wait/depth, worker batch processing, reconstruction, event flow, per-process system metrics, and correlation fields. Raw timing observations are capped (50,000 per metric; 10,000 request summaries) and the cap is recorded in the artifact. Metric fields are measurement-only because the runner resets diagnostics after warm-up.
+
+`async_trace_tail` is intentionally not reported as a fabricated exact duration: the current proposed transport is detached `void fetch`, so application code has no reliable response-sent timestamp that can be correlated with the detached completion. Submission initiation is measured; queue/worker/reconstruction timing is measured independently. Likewise, conventional collector reconstruction is measured from its actual in-memory collector grouping operation; it is not claimed to be a separate tracing backend stage.
+
 ## Automated experiment matrix
 
 Run the full automated matrix with one command:

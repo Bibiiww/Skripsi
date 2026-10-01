@@ -8,6 +8,7 @@ services:
       PORT: 3000
       CATALOG_URL: http://catalog:3000
       INVENTORY_URL: http://inventory:3000
+      INTERNAL_OBSERVABILITY: ${INTERNAL_OBSERVABILITY:-false}
     ports:
       - "8080:3000"
     depends_on:
@@ -21,6 +22,7 @@ services:
     environment:
       SERVICE_ROLE: catalog
       PORT: 3000
+      INTERNAL_OBSERVABILITY: ${INTERNAL_OBSERVABILITY:-false}
     healthcheck:
       test: ["CMD", "node", "-e", "fetch('http://localhost:3000/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
       interval: 5s
@@ -32,6 +34,7 @@ services:
     environment:
       SERVICE_ROLE: inventory
       PORT: 3000
+      INTERNAL_OBSERVABILITY: ${INTERNAL_OBSERVABILITY:-false}
     healthcheck:
       test: ["CMD", "node", "-e", "fetch('http://localhost:3000/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
       interval: 5s

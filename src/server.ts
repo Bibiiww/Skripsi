@@ -8,6 +8,7 @@ import { ConventionalTracer, type ActiveServerTrace, type TraceSpan } from "./tr
 import { currentProposedTraceId, runProposedRequest, type TraceEvent } from "./tracing/proposed.js";
 import { BoundedEventQueue } from "./tracing/queue.js";
 import { ReconstructionStore } from "./tracing/reconstruction.js";
+import { internalMetrics, observeBusiness, observeRequest, observeTiming, increment, resetInternalMetrics } from "./observability/internal.js";
 
 declare module "fastify" {
   interface FastifyRequest { conventionalTrace?: ActiveServerTrace; }
@@ -34,6 +35,8 @@ if (tracer) {
 }
 
 app.get("/health", async () => ({ status: "ok", role }));
+app.get("/v1/internal-observability", async () => ({ role, ...internalMetrics() }));
+app.post("/v1/internal-observability/reset", async () => { resetInternalMetrics(); return { reset: true, role }; });
 
 if (role === "trace-event-queue") {
   const queue = new BoundedEventQueue(Number(process.env.TRACE_QUEUE_CAPACITY ?? 10000));
@@ -51,42 +54,60 @@ if (role === "trace-event-queue") {
   });
   const workerQueueUrl = process.env.TRACE_QUEUE_URL ?? "http://trace-event-queue:3000";
   const workerIntervalMs = Number(process.env.TRACE_WORKER_POLL_INTERVAL_MS ?? 100);
+  let lastPollFinished = performance.now();
   const poll = async (): Promise<void> => {
+    const pollStarted = performance.now();
+    observeTiming("WORKER", "idle_time_ms", pollStarted - lastPollFinished);
     try {
       const response = await fetch(`${workerQueueUrl}/v1/events/dequeue`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ limit: 200 }) });
-      if (response.ok) store.accept((await response.json() as { events: TraceEvent[] }).events);
+      if (response.ok) {
+        const events = (await response.json() as { events: TraceEvent[] }).events;
+        increment("WORKER", "batches"); increment("WORKER", "events_dequeued", events.length);
+        const processingStarted = performance.now(); store.accept(events);
+        observeTiming("WORKER", "processing_duration_ms", performance.now() - processingStarted);
+        observeTiming("WORKER", "batch_duration_ms", performance.now() - pollStarted); increment("WORKER", "events_processed", events.length);
+      }
     } catch { /* queue not ready; next poll retries */ }
+    finally { lastPollFinished = performance.now(); }
   };
   setInterval(() => void poll(), workerIntervalMs);
 } else if (role === "trace-collector") {
   const spans: TraceSpan[] = [];
   app.post<{ Body: TraceSpan }>("/v1/spans", async (request, reply) => {
-    spans.push(request.body);
+    const started = performance.now(); spans.push(request.body); increment("COLLECTOR", "spans_received"); observeTiming("COLLECTOR", "processing_duration_ms", performance.now() - started);
     return reply.code(202).send({ accepted: true });
   });
   app.get<{ Params: { traceId: string } }>("/v1/traces/:traceId", async (request) => {
     return { traceId: request.params.traceId, spans: spans.filter((span) => span.traceId === request.params.traceId) };
   });
   app.get("/v1/spans", async () => ({ count: spans.length, spans }));
+  app.get("/v1/metrics", async () => {
+    const started = performance.now(); const byTrace = new Map<string, TraceSpan[]>();
+    for (const span of spans) byTrace.set(span.traceId, [...(byTrace.get(span.traceId) ?? []), span]);
+    const completeTraces = [...byTrace.values()].filter((trace) => trace.some((span) => span.kind === "server")).length;
+    const reconstructionDurationMs = performance.now() - started;
+    observeTiming("RECONSTRUCTION", "duration_ms", reconstructionDurationMs); increment("RECONSTRUCTION", "attempts", byTrace.size); increment("RECONSTRUCTION", "success", completeTraces); increment("RECONSTRUCTION", "failed", byTrace.size - completeTraces);
+    return { spansCreated: spans.length, spansReceived: spans.length, spansProcessed: spans.length, observedTraces: byTrace.size, completeTraces, reconstructionDurationMs };
+  });
 } else if (role === "catalog") {
-  app.get<{ Params: { productId: string } }>("/products/:productId", async (request, reply) => runProposedRequest(request.headers, "catalog.handler.getProduct", async () => {
+  app.get<{ Params: { productId: string } }>("/products/:productId", async (request, reply) => observeRequest("catalog.handler.getProduct", () => runProposedRequest(request.headers, "catalog.handler.getProduct", () => observeBusiness("handler", async () => {
     const traceId = currentProposedTraceId(); if (traceId) reply.header("x-trace-id", traceId);
     try { return await getProduct(request.params.productId); }
     catch { return reply.code(404).send({ error: "product_not_found" }); }
-  }));
+  }))));
 } else if (role === "inventory") {
   app.get<{ Params: { productId: string }; Querystring: { quantity?: string } }>("/availability/:productId", async (request, reply) => {
-    return runProposedRequest(request.headers, "inventory.handler.checkAvailability", async () => {
+    return observeRequest("inventory.handler.checkAvailability", () => runProposedRequest(request.headers, "inventory.handler.checkAvailability", () => observeBusiness("handler", async () => {
       const traceId = currentProposedTraceId(); if (traceId) reply.header("x-trace-id", traceId);
       const quantity = Number(request.query.quantity);
       if (!Number.isInteger(quantity) || quantity < 1) return reply.code(400).send({ error: "quantity_must_be_a_positive_integer" });
       try { return await checkAvailability(request.params.productId, quantity); }
       catch { return reply.code(404).send({ error: "product_not_found" }); }
-    });
+    })));
   });
 } else if (role === "gateway") {
   app.get<{ Querystring: { productId?: string; quantity?: string; profile?: string; compute?: ComputationalSignature; structure?: StructuralSignature; inputSize?: string } }>("/api/v1/quote", async (request, reply) => {
-    return runProposedRequest(request.headers, "gateway.handler.quote", async () => {
+    return observeRequest("gateway.handler.quote", () => runProposedRequest(request.headers, "gateway.handler.quote", () => observeBusiness("handler", async () => {
       const traceId = currentProposedTraceId(); if (traceId) reply.header("x-trace-id", traceId);
       const productId = request.query.productId;
       const quantity = Number(request.query.quantity);
@@ -105,14 +126,14 @@ if (role === "trace-event-queue") {
         // and client-to-gateway transfer, while retaining tracing overhead that
         // occurs inside the comparable business path for each condition.
         const businessStarted = performance.now();
-        const quote = await buildQuote(catalogUrl, inventoryUrl, productId, quantity, profile, trace);
+        const quote = await observeBusiness("service", () => buildQuote(catalogUrl, inventoryUrl, productId, quantity, profile, trace), true);
         reply.header("x-business-processing-ms", (performance.now() - businessStarted).toFixed(3));
         return quote;
       } catch (error) {
         const message = error instanceof Error ? error.message : "REQUEST_FAILED";
         return reply.code(message === "INSUFFICIENT_STOCK" ? 409 : 502).send({ error: message.toLowerCase() });
       }
-    });
+    })));
   });
 } else {
   throw new Error(`Unsupported SERVICE_ROLE: ${role}`);

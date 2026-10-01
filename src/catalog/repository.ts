@@ -1,5 +1,6 @@
 import type { Product } from "../domain/types.js";
 import { withProposedSpan } from "../tracing/proposed.js";
+import { observeBusiness } from "../observability/internal.js";
 
 // Deliberately deterministic: later workloads can vary compute and structure
 // without a database's cache state becoming an uncontrolled variable.
@@ -10,5 +11,5 @@ const products: Record<string, Product> = {
 };
 
 export async function findProduct(id: string): Promise<Product | undefined> {
-  return withProposedSpan("catalog.repository.findProduct", "repository", async () => products[id]);
+  return observeBusiness("repository", () => withProposedSpan("catalog.repository.findProduct", "repository", async () => products[id]));
 }

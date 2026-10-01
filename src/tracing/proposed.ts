@@ -1,5 +1,7 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 import { randomUUID } from "node:crypto";
+import { performance } from "node:perf_hooks";
+import { addRequestValue, increment, internalObservabilityEnabled, observeTiming } from "../observability/internal.js";
 
 export type ProposedTraceContext = { requestId: string; currentSpanId: string | null };
 export type TraceEvent = {
@@ -13,6 +15,8 @@ export type TraceEvent = {
   start_timestamp: string | null;
   end_timestamp: string | null;
   outcome: "ok" | "error" | null;
+  event_created_at_ms?: number;
+  event_enqueued_at_ms?: number;
 };
 
 const enabled = process.env.TRACING_MODE === "proposed";
@@ -25,10 +29,18 @@ function headerValue(value: string | string[] | undefined): string | undefined {
 }
 
 function emit(event: TraceEvent): void {
+  const serializeStarted = performance.now();
+  const body = JSON.stringify(event);
+  const serializationMs = performance.now() - serializeStarted;
+  if (internalObservabilityEnabled()) { increment("EVENT_CAPTURE", "events_produced"); addRequestValue("events_produced", 1); observeTiming("SERIALIZATION", "duration_ms", serializationMs); addRequestValue("serialization_duration_ms", serializationMs); increment("SERIALIZATION", "bytes", Buffer.byteLength(body)); }
   // Intentionally not awaited: bounded queue submission is off the request path.
-  void fetch(`${queueUrl}/v1/events`, {
-    method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(event)
-  }).catch(() => undefined);
+  const submissionStarted = performance.now();
+  let pending: Promise<Response>;
+  try { pending = fetch(`${queueUrl}/v1/events`, { method: "POST", headers: { "content-type": "application/json" }, body }); }
+  catch { increment("EVENT_SUBMISSION", "initiation_errors"); return; }
+  const initiationMs = performance.now() - submissionStarted;
+  if (internalObservabilityEnabled()) { increment("EVENT_SUBMISSION", "attempts"); increment("EVENT_SUBMISSION", "initiated"); increment("EVENT_SUBMISSION", "bytes", Buffer.byteLength(body)); observeTiming("EVENT_SUBMISSION", "init_duration_ms", initiationMs); addRequestValue("submission_init_duration_ms", initiationMs); }
+  void pending.then(() => increment("EVENT_SUBMISSION", "completed")).catch(() => increment("EVENT_SUBMISSION", "errors"));
 }
 
 export function proposedTraceHeaders(): Record<string, string> | undefined {
@@ -48,12 +60,13 @@ export async function withProposedSpan<T>(
   execute: () => Promise<T>
 ): Promise<T> {
   if (!enabled) return execute();
-  const parent = storage.getStore();
+  const lookupStarted = performance.now(); const parent = storage.getStore(); observeTiming("CONTEXT", "lookup_ms", performance.now() - lookupStarted);
   if (!parent) return execute();
-  const spanId = randomUUID();
-  const startTimestamp = new Date().toISOString();
-  emit({ request_id: parent.requestId, span_id: spanId, parent_span_id: parent.currentSpanId, event_type: "ENTRY", function_name: functionName, layer, service_name: serviceName, start_timestamp: startTimestamp, end_timestamp: null, outcome: null });
-  return storage.run({ requestId: parent.requestId, currentSpanId: spanId }, async () => {
+  const preStarted = performance.now(); const idStarted = performance.now(); const spanId = randomUUID(); observeTiming("WRAPPER", "span_id_generation_ms", performance.now() - idStarted);
+  const timestampStarted = performance.now(); const startTimestamp = new Date().toISOString(); observeTiming("WRAPPER", "timestamp_generation_ms", performance.now() - timestampStarted);
+  const entryStarted = performance.now(); const entry = { request_id: parent.requestId, span_id: spanId, parent_span_id: parent.currentSpanId, event_type: "ENTRY" as const, function_name: functionName, layer, service_name: serviceName, start_timestamp: startTimestamp, end_timestamp: null, outcome: null, event_created_at_ms: Date.now() }; const entryMs = performance.now() - entryStarted; increment("EVENT_CAPTURE", "entry_events"); observeTiming("EVENT_CAPTURE", "entry_event_creation_ms", entryMs); observeTiming("EVENT_CAPTURE", "duration_ms", entryMs); addRequestValue("capture_duration_ms", entryMs); emit(entry);
+  const preMs = performance.now() - preStarted; observeTiming("WRAPPER", "pre_ms", preMs);
+  const alsStarted = performance.now(); const result = storage.run({ requestId: parent.requestId, currentSpanId: spanId }, async () => {
     let outcome: TraceEvent["outcome"] = "ok";
     try {
       return await execute();
@@ -61,9 +74,9 @@ export async function withProposedSpan<T>(
       outcome = "error";
       throw error;
     } finally {
-      emit({ request_id: parent.requestId, span_id: spanId, parent_span_id: parent.currentSpanId, event_type: "EXIT", function_name: functionName, layer, service_name: serviceName, start_timestamp: null, end_timestamp: new Date().toISOString(), outcome });
+      const postStarted = performance.now(); const exitStarted = performance.now(); const exit = { request_id: parent.requestId, span_id: spanId, parent_span_id: parent.currentSpanId, event_type: "EXIT" as const, function_name: functionName, layer, service_name: serviceName, start_timestamp: null, end_timestamp: new Date().toISOString(), outcome, event_created_at_ms: Date.now() }; const exitMs = performance.now() - exitStarted; increment("EVENT_CAPTURE", "exit_events"); observeTiming("EVENT_CAPTURE", "exit_event_creation_ms", exitMs); observeTiming("EVENT_CAPTURE", "duration_ms", exitMs); addRequestValue("capture_duration_ms", exitMs); emit(exit); const postMs = performance.now() - postStarted; observeTiming("WRAPPER", "post_ms", postMs); observeTiming("WRAPPER", "total_overhead_ms", preMs + postMs); addRequestValue("wrapper_duration_ms", preMs + postMs);
     }
-  });
+  }); observeTiming("WRAPPER", "async_local_storage_run_ms", performance.now() - alsStarted); return result;
 }
 
 export async function runProposedRequest<T>(

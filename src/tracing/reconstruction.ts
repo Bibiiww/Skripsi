@@ -1,4 +1,6 @@
 import type { TraceEvent } from "./proposed.js";
+import { performance } from "node:perf_hooks";
+import { increment, observeTiming } from "../observability/internal.js";
 
 export type ReconstructedSpan = {
   spanId: string; parentSpanId: string | null; functionName: string; layer: TraceEvent["layer"]; serviceName: string;
@@ -17,8 +19,9 @@ export class ReconstructionStore {
   }
 
   get(requestId: string): ReconstructedTrace | undefined {
+    const started = performance.now(); increment("RECONSTRUCTION", "attempts");
     const events = this.eventsByRequest.get(requestId);
-    if (!events) return undefined;
+    if (!events) { increment("RECONSTRUCTION", "failed"); return undefined; }
     const pairs = new Map<string, { entry?: TraceEvent; exit?: TraceEvent }>();
     for (const event of events) {
       const pair = pairs.get(event.span_id) ?? {};
@@ -36,7 +39,9 @@ export class ReconstructionStore {
     const roots = nodes.filter((node) => node.parentSpanId === null);
     const incompleteSpans = pairs.size - nodes.length;
     const complete = roots.length === 1 && incompleteSpans === 0 && nodes.every((node) => node.parentSpanId === null || ids.has(node.parentSpanId));
-    return { requestId, events, nodes, edges, complete, incompleteSpans };
+    const result = { requestId, events, nodes, edges, complete, incompleteSpans };
+    increment("RECONSTRUCTION", complete ? "success" : "failed"); observeTiming("RECONSTRUCTION", "duration_ms", performance.now() - started);
+    return result;
   }
 
   summary() {
