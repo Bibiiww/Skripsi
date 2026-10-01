@@ -125,11 +125,12 @@ async function newestRunDirectory(runsDirectory, previousNames) {
 }
 
 async function summarizeRun(runDirectory) {
-  const [manifest, http, tracing, resources] = await Promise.all([
+  const [manifest, http, tracing, resources, internal] = await Promise.all([
     readFile(join(runDirectory, "manifest.json"), "utf8").then(JSON.parse),
     readFile(join(runDirectory, "http-summary.json"), "utf8").then(JSON.parse),
     readFile(join(runDirectory, "tracing-metrics.json"), "utf8").then(JSON.parse).catch(() => null),
-    readFile(join(runDirectory, "container-metrics.json"), "utf8").then(JSON.parse)
+    readFile(join(runDirectory, "container-metrics.json"), "utf8").then(JSON.parse),
+    readFile(join(runDirectory, "internal-observability.json"), "utf8").then(JSON.parse).catch(() => null)
   ]);
   return {
     runId: manifest.runId,
@@ -142,9 +143,15 @@ async function summarizeRun(runDirectory) {
     finishedAt: manifest.finishedAt,
     http,
     tracing,
+    internal,
     resources: resourceSummary(resources, manifest.hostCapacity),
     runDirectory
   };
+}
+
+function internalNumber(record, path) {
+  const value = path.split(".").reduce((current, key) => current?.[key], record.internal);
+  return toNumber(value);
 }
 
 function flatRecord(record) {
@@ -263,10 +270,61 @@ const saturated = flattened.filter((record) => record.status === "saturated");
 const rejected = flattened.filter((record) => record.status !== "completed" && record.status !== "saturated");
 const columns = [...new Set(flattened.flatMap((record) => Object.keys(record)))];
 const csvText = (rows) => `${columns.join(",")}\n${rows.map((record) => columns.map((column) => csv(record[column])).join(",")).join("\n")}\n`;
+const conditionSummary = [];
+for (const [key, rows] of Object.entries(flattened.filter((record) => record.status === "completed" || record.status === "saturated").reduce((groups, record) => {
+  const groupKey = `${record.condition}\u0000${record.descriptor_id}`;
+  (groups[groupKey] ??= []).push(record); return groups;
+}, {}))) {
+  const [condition, descriptorId] = key.split("\u0000");
+  const successRates = rows.map((row) => row.success_rate_percent).filter(Number.isFinite);
+  conditionSummary.push({
+    condition, descriptor_id: descriptorId, target_rps: rows[0].target_rps, runs: rows.length,
+    completed_runs: rows.filter((row) => row.status === "completed").length,
+    saturated_runs: rows.filter((row) => row.status === "saturated").length,
+    success_rate_percent_mean: average(successRates),
+    success_rate_percent_min: successRates.length ? Math.min(...successRates) : null,
+    achieved_rps_mean: average(rows.map((row) => row.achieved_rps)),
+    generator_drop_rate_percent_mean: average(rows.map((row) => row.generator_drop_rate_percent)),
+    request_latency_p95_ms_mean: average(rows.map((row) => row.request_latency_p95_ms))
+  });
+}
+const summaryColumns = ["condition", "descriptor_id", "target_rps", "runs", "completed_runs", "saturated_runs", "success_rate_percent_mean", "success_rate_percent_min", "achieved_rps_mean", "generator_drop_rate_percent_mean", "request_latency_p95_ms_mean"];
+const summaryCsv = `${summaryColumns.join(",")}\n${conditionSummary.map((record) => summaryColumns.map((column) => csv(record[column])).join(",")).join("\n")}\n`;
+const internalRows = records.filter((record) => record.internal?.diagnosticMode && (record.status === "completed" || record.status === "saturated"));
+const internalSummary = [];
+for (const [key, rows] of Object.entries(internalRows.reduce((groups, record) => {
+  const groupKey = `${record.condition}\u0000${record.descriptorId}`;
+  (groups[groupKey] ??= []).push(record); return groups;
+}, {}))) {
+  const [condition, descriptorId] = key.split("\u0000");
+  const aggregate = (path) => average(rows.map((row) => internalNumber(row, path)));
+  internalSummary.push({
+    condition, descriptor_id: descriptorId, runs: rows.length,
+    events_per_request_mean: aggregate("event_capture.events_per_request"),
+    wrapper_total_ms_mean: aggregate("wrapper.total_ms.mean"),
+    wrapper_total_ms_p95_mean: aggregate("wrapper.total_ms.p95"),
+    serialization_ms_mean: aggregate("serialization.duration_ms.mean"),
+    serialization_ms_p95_mean: aggregate("serialization.duration_ms.p95"),
+    serialization_bytes_per_request_mean: aggregate("serialization.bytes_per_request"),
+    submission_init_ms_mean: aggregate("event_submission.init_duration_ms.mean"),
+    queue_depth_mean: aggregate("queue.depth_mean"),
+    queue_utilization_max_mean: aggregate("queue.utilization_max"),
+    queue_wait_p95_ms_mean: aggregate("queue.wait_ms.p95"),
+    queue_drop_rate_mean: aggregate("queue.enqueue_drop_rate"),
+    worker_throughput_events_per_second_mean: aggregate("worker.throughput_events_per_second"),
+    reconstruction_success_rate_mean: aggregate("reconstruction.success_rate"),
+    business_p95_ms_mean: aggregate("business.duration_ms.p95"),
+    request_p95_ms_mean: aggregate("request.request_latency.p95")
+  });
+}
+const internalColumns = ["condition", "descriptor_id", "runs", "events_per_request_mean", "wrapper_total_ms_mean", "wrapper_total_ms_p95_mean", "serialization_ms_mean", "serialization_ms_p95_mean", "serialization_bytes_per_request_mean", "submission_init_ms_mean", "queue_depth_mean", "queue_utilization_max_mean", "queue_wait_p95_ms_mean", "queue_drop_rate_mean", "worker_throughput_events_per_second_mean", "reconstruction_success_rate_mean", "business_p95_ms_mean", "request_p95_ms_mean"];
+const internalCsv = `${internalColumns.join(",")}\n${internalSummary.map((record) => internalColumns.map((column) => csv(record[column])).join(",")).join("\n")}\n`;
 await writeFile(join(matrixDirectory, "analysis.json"), `${JSON.stringify({ schemaVersion: "1.2.0", matrixId, generatedAt: new Date().toISOString(), comparisonRuns: valid, stressTestRuns: saturated, failedRuns: rejected }, null, 2)}\n`);
 await writeFile(join(matrixDirectory, "analysis.csv"), csvText(valid));
 await writeFile(join(matrixDirectory, "stress-test.csv"), csvText(saturated));
 await writeFile(join(matrixDirectory, "failed-runs.csv"), csvText(rejected));
+await writeFile(join(matrixDirectory, "condition-summary.csv"), summaryCsv);
+await writeFile(join(matrixDirectory, "internal-observability-summary.csv"), internalCsv);
 try { await execute(process.execPath, ["tools/generate-charts.mjs", "--matrix-dir", matrixDirectory]); }
 catch (error) { matrix.chartGenerationError = error instanceof Error ? error.message : String(error); }
 matrix.status = failures ? "completed_with_failures" : "completed";

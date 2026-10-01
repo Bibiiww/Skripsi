@@ -162,12 +162,28 @@ Each diagnostic run adds `latency.json`, `resource.json`, and `internal-observab
 
 `async_trace_tail` is intentionally not reported as a fabricated exact duration: the current proposed transport is detached `void fetch`, so application code has no reliable response-sent timestamp that can be correlated with the detached completion. Submission initiation is measured; queue/worker/reconstruction timing is measured independently. Likewise, conventional collector reconstruction is measured from its actual in-memory collector grouping operation; it is not claimed to be a separate tracing backend stage.
 
+### Docker smoke test for diagnostic instrumentation
+
+Run this before a long matrix. It starts only the proposed stack, executes one low-load workload, and writes one diagnostic artifact. The final cleanup is important because port `8080` is shared by all conditions.
+
+```powershell
+$env:INTERNAL_OBSERVABILITY = "true"
+docker compose -p tracing-observability-smoke -f compose.yaml -f compose.proposed.yaml up --build -d --wait
+node tools/run-experiment.mjs --descriptor workloads/v1/o1-shallow-low.json --condition proposed --compose-project tracing-observability-smoke --internal-observability true
+docker compose -p tracing-observability-smoke -f compose.yaml -f compose.proposed.yaml down --remove-orphans
+```
+
+Confirm that the new run folder contains `internal-observability.json` and that `diagnosticMode` is `true`. This validates instrumentation only; do not use it as a final performance result.
+
 ## Automated experiment matrix
 
-Run the full automated matrix with one command:
+Use `run-experiment` for one condition and one descriptor. Use `run-matrix` to run every selected descriptor automatically. The following commands split a full collection into three independent matrices:
 
-```sh
-pnpm matrix
+```powershell
+$env:INTERNAL_OBSERVABILITY = "true"
+node tools/run-matrix.mjs --conditions baseline --repetitions 3
+node tools/run-matrix.mjs --conditions conventional --repetitions 3
+node tools/run-matrix.mjs --conditions proposed --repetitions 3
 ```
 
 It runs the conditions in this order: `baseline`, `conventional`, then `proposed`.
@@ -179,7 +195,7 @@ repetition, a five-second cooldown, and a maximum transport-error rate of 5%.
 
 Each invocation writes `results/<matrix-id>/` containing `matrix-manifest.json`,
 per-run raw artifacts under `runs/`, and analysis-ready `analysis.json` and
-`analysis.csv`. The flat analysis files include only valid measurements. Rejected
+`analysis.csv`. `condition-summary.csv` gives one row per condition/workload with mean and minimum `success_rate_percent`, achieved RPS, generator-drop rate, p95 latency, and completed/saturated counts. Therefore conventional success rate is explicit both per-run in `analysis.csv`/`stress-test.csv` and per-workload in `condition-summary.csv`. When `INTERNAL_OBSERVABILITY=true`, `internal-observability-summary.csv` also aggregates wrapper, serialization, submission-initiation, queue, worker, reconstruction, business p95, and request p95 metrics per condition/workload. The flat analysis files include only valid measurements. Rejected
 runs are recorded separately in `failed-runs.csv` and the matrix manifest, with
 their error details. A run is rejected when it has no successful HTTP response or
 its transport-error rate exceeds 5%; the command continues to remaining runs,
@@ -220,19 +236,19 @@ Examples:
 
 ```sh
 # Three repetitions of all conditions and workloads.
-pnpm matrix -- --repetitions 3
+node tools/run-matrix.mjs --repetitions 3
 
 # A compact pilot: mixed workload only, one run per condition.
-pnpm matrix -- --descriptors mixed-complex-high --cooldown-seconds 0
+node tools/run-matrix.mjs --descriptors mixed-complex-high --cooldown-seconds 0
 
 # Select specific conditions or descriptors.
-pnpm matrix -- --conditions baseline,proposed --descriptors o1-shallow-low,ologn-moderate-mid
+node tools/run-matrix.mjs --conditions baseline,proposed --descriptors o1-shallow-low,ologn-moderate-mid
 
-# Reject a run if more than 2% of observed requests have transport errors.
-pnpm matrix -- --max-transport-error-rate 0.02
+# Classify a run as saturated below 98% success/target-rate attainment.
+node tools/run-matrix.mjs --saturation-threshold-percent 98
 
 # Override the host endpoint when Docker uses a different published address.
-pnpm matrix -- --base-url http://127.0.0.1:8080
+node tools/run-matrix.mjs --base-url http://127.0.0.1:8080
 ```
 
 ## Next implementation stages
