@@ -64,9 +64,9 @@ function resourceSummary(metrics, capacity) {
   };
 }
 
-function execute(command, args, { quiet = false } = {}) {
+function execute(command, args, { quiet = false, env } = {}) {
   return new Promise((resolveCommand, rejectCommand) => {
-    const child = spawn(command, args, { stdio: quiet ? ["ignore", "pipe", "pipe"] : "inherit" });
+    const child = spawn(command, args, { stdio: quiet ? ["ignore", "pipe", "pipe"] : "inherit", env: env ? { ...process.env, ...env } : process.env });
     let output = "";
     if (quiet) {
       child.stdout.on("data", (chunk) => { output += chunk; });
@@ -81,15 +81,15 @@ async function sleep(milliseconds) {
   await new Promise((resolveSleep) => setTimeout(resolveSleep, milliseconds));
 }
 
-async function startStack(composeArguments) {
+async function startStack(composeArguments, env) {
   let lastError;
   for (let attempt = 1; attempt <= 2; attempt += 1) {
     try {
-      await execute("docker", [...composeArguments, "up", "--build", "--detach", "--wait", "--wait-timeout", "120"]);
+      await execute("docker", [...composeArguments, "up", "--build", "--detach", "--wait", "--wait-timeout", "120"], { env });
       return;
     } catch (error) {
       lastError = error;
-      try { await execute("docker", [...composeArguments, "down", "--remove-orphans"], { quiet: true }); } catch { /* retry after best-effort cleanup */ }
+      try { await execute("docker", [...composeArguments, "down", "--remove-orphans"], { quiet: true, env }); } catch { /* retry after best-effort cleanup */ }
       if (attempt === 1) await sleep(5000);
     }
   }
@@ -139,6 +139,7 @@ async function summarizeRun(runDirectory) {
     descriptorSha256: manifest.descriptorSha256,
     status: manifest.status,
     measurementValidation: manifest.measurementValidation,
+    measurementBoundary: manifest.measurementBoundary,
     startedAt: manifest.startedAt,
     finishedAt: manifest.finishedAt,
     http,
@@ -164,6 +165,8 @@ function flatRecord(record) {
     descriptor_id: record.descriptorId,
     descriptor_sha256: record.descriptorSha256,
     status: record.status,
+    valid: record.measurementValidation?.valid ?? false,
+    saturated: record.measurementValidation?.saturated ?? record.status === "saturated",
     started_at: record.startedAt,
     finished_at: record.finishedAt,
     achieved_rps: toNumber(http.achievedRps),
@@ -206,6 +209,38 @@ function flatRecord(record) {
   };
 }
 
+function primaryRecord(record) {
+  const http = record.http ?? {}; const resources = record.resources ?? { cpuPercent: {}, memoryBytes: {} };
+  return {
+    run_id: record.runId, condition: record.condition, workload_id: record.descriptorId, descriptor_sha256: record.descriptorSha256,
+    measurement_boundary: record.measurementBoundary?.version ?? "legacy-measurement-boundary-uncertain",
+    achieved_rps: toNumber(http.achievedRps), successful_requests: http.successfulRequests ?? null,
+    request_latency_mean_ms: toNumber(http.latencyMs?.mean), request_latency_p50_ms: toNumber(http.latencyMs?.p50), request_latency_p95_ms: toNumber(http.latencyMs?.p95), request_latency_p99_ms: toNumber(http.latencyMs?.p99),
+    business_latency_mean_ms: toNumber(http.businessProcessingMs?.mean), business_latency_p50_ms: toNumber(http.businessProcessingMs?.p50), business_latency_p95_ms: toNumber(http.businessProcessingMs?.p95), business_latency_p99_ms: toNumber(http.businessProcessingMs?.p99),
+    cpu_mean_percent: resources.cpuPercent.mean ?? null, cpu_max_percent: resources.cpuPercent.max ?? null,
+    memory_mean_mb: resources.memoryBytes.mean === null ? null : resources.memoryBytes.mean / 1024 ** 2,
+    memory_max_mb: resources.memoryBytes.max === null ? null : resources.memoryBytes.max / 1024 ** 2
+  };
+}
+
+function observabilityRecord(record) {
+  const internal = record.internal ?? {}; const event = internal.event_capture ?? {}; const queue = internal.queue ?? {}; const worker = internal.worker ?? {}; const reconstruction = internal.reconstruction ?? {}; const serialization = internal.serialization ?? {}; const submission = internal.event_submission ?? {}; const wrapper = internal.wrapper ?? {};
+  return {
+    run_id: record.runId, condition: record.condition, workload_id: record.descriptorId,
+    events_produced: event.events_produced ?? null, events_enqueued: queue.enqueue_success ?? null, events_dropped: queue.enqueue_dropped ?? null, events_reconstructed: internal.event_flow?.reconstructed ?? null,
+    queue_drop_rate: queue.enqueue_drop_rate ?? null, reconstruction_success_rate: reconstruction.success_rate ?? null,
+    queue_depth_mean: queue.depth_mean ?? null, queue_depth_max: queue.depth_max ?? null, queue_utilization_max: queue.utilization_max ?? null, queue_wait_p95_ms: queue.wait_ms?.p95 ?? null,
+    worker_throughput_events_per_second: worker.throughput_events_per_second ?? null, worker_processing_p95_ms: worker.processing_duration_ms?.p95 ?? null,
+    serialization_p95_ms: serialization.duration_ms?.p95 ?? null, serialization_bytes: serialization.bytes ?? null,
+    submission_init_p95_ms: submission.init_duration_ms?.p95 ?? null, wrapper_total_p95_ms: wrapper.total_ms?.p95 ?? null, event_capture_p95_ms: event.capture_duration_ms?.p95 ?? null
+  };
+}
+
+function validationRecord(record) {
+  const validation = record.measurementValidation ?? {};
+  return { run_id: record.runId, condition: record.condition, workload_id: record.descriptorId, status: record.status, saturated: validation.saturated ?? record.status === "saturated", valid: validation.valid ?? false, comparison_eligible: validation.comparisonEligible ?? false, diagnostic_instrumentation_enabled: validation.diagnosticInstrumentationEnabled ?? false, diagnostic_artifacts_absent: validation.diagnosticArtifactsAbsent ?? false, measurement_boundary_valid: validation.measurementBoundaryValid ?? false, workload_consistent: validation.workloadConsistent ?? false, condition_valid: validation.conditionValid ?? false, primary_metrics_complete: validation.primaryMetricsComplete ?? false, resource_metrics_complete: validation.resourceMetricsComplete ?? false, observability_metrics_complete: validation.observabilityMetricsComplete ?? null, reason: [...(validation.invalidReasons ?? []), ...(validation.saturationSignals ?? [])].join(";") || null };
+}
+
 const conditions = (option("--conditions", conditionsAllowed.join(","))).split(",").map((value) => value.trim()).filter(Boolean);
 if (!conditions.length || conditions.some((condition) => !conditionsAllowed.includes(condition))) throw new Error("--conditions must contain baseline, conventional, and/or proposed.");
 const repetitions = Number(option("--repetitions", "1"));
@@ -215,6 +250,10 @@ if (!Number.isFinite(cooldownSeconds) || cooldownSeconds < 0) throw new Error("-
 const saturationThresholdPercent = Number(option("--saturation-threshold-percent", "95"));
 if (!Number.isFinite(saturationThresholdPercent) || saturationThresholdPercent <= 0 || saturationThresholdPercent > 100) throw new Error("--saturation-threshold-percent must be greater than 0 and at most 100.");
 const baseUrl = option("--base-url", "http://127.0.0.1:8080");
+const measurementMode = option("--measurement-mode", "primary");
+if (!["primary", "diagnostic"].includes(measurementMode)) throw new Error("--measurement-mode must be primary or diagnostic.");
+const internalObservability = measurementMode === "diagnostic" ? "true" : "false";
+const matrixEnvironment = { INTERNAL_OBSERVABILITY: internalObservability };
 const resultsRoot = resolve(option("--results-dir", "results"));
 const matrixId = `${new Date().toISOString().replace(/[:.]/g, "-")}-matrix-${randomUUID().slice(0, 8)}`;
 const matrixDirectory = join(resultsRoot, matrixId);
@@ -224,7 +263,7 @@ const records = [];
 const matrix = {
   schemaVersion: "1.0.0", matrixId, status: "running", startedAt: new Date().toISOString(),
   conditions, descriptors: selected.map(({ descriptor }) => ({ id: descriptor.id, rateRps: descriptor.request.rateRps, path: descriptor.request.path })),
-  repetitions, cooldownSeconds, saturationThresholdPercent, baseUrl, order: "condition -> descriptor (low to high RPS) -> repetition", stackReset: "before every workload repetition", records
+  repetitions, cooldownSeconds, saturationThresholdPercent, baseUrl, measurementMode, internalObservability, order: "condition -> descriptor (low to high RPS) -> repetition", stackReset: "before every workload repetition", records
 };
 await mkdir(runsDirectory, { recursive: true });
 await writeFile(join(matrixDirectory, "matrix-manifest.json"), `${JSON.stringify(matrix, null, 2)}\n`);
@@ -238,9 +277,9 @@ for (const condition of conditions) {
       const composeArguments = ["compose", "-p", project, ...files.flatMap((file) => ["-f", file])];
       const previousNames = new Set((await readdir(runsDirectory, { withFileTypes: true })).filter((entry) => entry.isDirectory()).map((entry) => entry.name));
       try {
-        await startStack(composeArguments);
+        await startStack(composeArguments, matrixEnvironment);
         try {
-          await execute(process.execPath, ["tools/run-experiment.mjs", "--descriptor", path, "--condition", condition, "--compose-project", project, "--results-dir", runsDirectory, "--base-url", baseUrl, "--saturation-threshold-percent", String(saturationThresholdPercent)]);
+          await execute(process.execPath, ["tools/run-experiment.mjs", "--descriptor", path, "--condition", condition, "--compose-project", project, "--results-dir", runsDirectory, "--base-url", baseUrl, "--saturation-threshold-percent", String(saturationThresholdPercent), "--internal-observability", internalObservability], { env: matrixEnvironment });
           const newest = await newestRunDirectory(runsDirectory, previousNames);
           records.push({ ...await summarizeRun(join(runsDirectory, newest)), repetition, targetRps: descriptor.request.rateRps });
         } catch (error) {
@@ -255,7 +294,7 @@ for (const condition of conditions) {
         failures += 1;
         records.push({ condition, descriptorId: descriptor.id, status: "failed", repetition, error: error instanceof Error ? error.message : String(error) });
       } finally {
-        try { await execute("docker", [...composeArguments, "down", "--remove-orphans"], { quiet: true }); }
+        try { await execute("docker", [...composeArguments, "down", "--remove-orphans"], { quiet: true, env: matrixEnvironment }); }
         catch (error) { failures += 1; records.push({ condition, descriptorId: descriptor.id, status: "cleanup_failed", repetition, error: error instanceof Error ? error.message : String(error) }); }
         await writeFile(join(matrixDirectory, "matrix-manifest.json"), `${JSON.stringify(matrix, null, 2)}\n`);
         if (cooldownSeconds > 0) await sleep(cooldownSeconds * 1000);
@@ -265,11 +304,15 @@ for (const condition of conditions) {
 }
 
 const flattened = records.map(flatRecord);
-const valid = flattened.filter((record) => record.status === "completed");
+const valid = flattened.filter((record) => record.status === "completed" && record.valid);
 const saturated = flattened.filter((record) => record.status === "saturated");
-const rejected = flattened.filter((record) => record.status !== "completed" && record.status !== "saturated");
+const rejected = flattened.filter((record) => (record.status !== "completed" && record.status !== "saturated") || !record.valid);
 const columns = [...new Set(flattened.flatMap((record) => Object.keys(record)))];
 const csvText = (rows) => `${columns.join(",")}\n${rows.map((record) => columns.map((column) => csv(record[column])).join(",")).join("\n")}\n`;
+const recordsCsv = (rows) => { const recordColumns = [...new Set(rows.flatMap((record) => Object.keys(record)))]; return `${recordColumns.join(",")}\n${rows.map((record) => recordColumns.map((column) => csv(record[column])).join(",")).join("\n")}\n`; };
+const primaryRows = records.filter((record) => record.status === "completed" && record.measurementValidation?.valid && record.measurementValidation?.comparisonEligible).map(primaryRecord);
+const observabilityRows = records.filter((record) => record.internal?.diagnosticMode).map(observabilityRecord);
+const validationRows = records.map(validationRecord);
 const conditionSummary = [];
 for (const [key, rows] of Object.entries(flattened.filter((record) => record.status === "completed" || record.status === "saturated").reduce((groups, record) => {
   const groupKey = `${record.condition}\u0000${record.descriptor_id}`;
@@ -325,6 +368,9 @@ await writeFile(join(matrixDirectory, "stress-test.csv"), csvText(saturated));
 await writeFile(join(matrixDirectory, "failed-runs.csv"), csvText(rejected));
 await writeFile(join(matrixDirectory, "condition-summary.csv"), summaryCsv);
 await writeFile(join(matrixDirectory, "internal-observability-summary.csv"), internalCsv);
+await writeFile(join(matrixDirectory, "primary_results.csv"), recordsCsv(primaryRows));
+await writeFile(join(matrixDirectory, "observability_results.csv"), recordsCsv(observabilityRows));
+await writeFile(join(matrixDirectory, "run_validation.csv"), recordsCsv(validationRows));
 try { await execute(process.execPath, ["tools/generate-charts.mjs", "--matrix-dir", matrixDirectory]); }
 catch (error) { matrix.chartGenerationError = error instanceof Error ? error.message : String(error); }
 matrix.status = failures ? "completed_with_failures" : "completed";

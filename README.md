@@ -56,6 +56,16 @@ Not yet specified by the proposal and therefore treated as **experimental design
 - a third baseline condition, retained to make each tracing overhead calculation auditable;
 - workload descriptors for computational signature, structural signature, input size, and request intensity.
 
+## Measurement validity
+
+The fixed measurement boundary, metric classes, saturation signals, validation
+rules, output datasets, and legacy-data policy are documented in
+[MEASUREMENT_FRAMEWORK.md](MEASUREMENT_FRAMEWORK.md). Use normal mode
+(`INTERNAL_OBSERVABILITY=false`, the default) to collect `primary_results.csv`.
+Use diagnostic mode only in a separate explanatory run; its results are written
+to `observability_results.csv` and are not automatically eligible for primary
+comparison.
+
 ## Workload descriptors and experiment runner
 
 `workloads/v1/` contains versioned JSON descriptors. Each pins the computational
@@ -177,13 +187,19 @@ Confirm that the new run folder contains `internal-observability.json` and that 
 
 ## Automated experiment matrix
 
-Use `run-experiment` for one condition and one descriptor. Use `run-matrix` to run every selected descriptor automatically. The following commands split a full collection into three independent matrices:
+Use `run-experiment` for one condition and one descriptor. Use `run-matrix` to run every selected descriptor automatically. Collect the primary comparison dataset with diagnostic instrumentation off:
 
 ```powershell
-$env:INTERNAL_OBSERVABILITY = "true"
-node tools/run-matrix.mjs --conditions baseline --repetitions 3
-node tools/run-matrix.mjs --conditions conventional --repetitions 3
-node tools/run-matrix.mjs --conditions proposed --repetitions 3
+node tools/run-matrix.mjs --measurement-mode primary --conditions baseline --repetitions 3
+node tools/run-matrix.mjs --measurement-mode primary --conditions conventional --repetitions 3
+node tools/run-matrix.mjs --measurement-mode primary --conditions proposed --repetitions 3
+```
+
+Run a separate diagnostic matrix only when explaining a finding. It produces
+observability artifacts but is intentionally excluded from `primary_results.csv`:
+
+```powershell
+node tools/run-matrix.mjs --measurement-mode diagnostic --conditions proposed --repetitions 3
 ```
 
 It runs the conditions in this order: `baseline`, `conventional`, then `proposed`.
@@ -195,7 +211,7 @@ repetition, a five-second cooldown, and a maximum transport-error rate of 5%.
 
 Each invocation writes `results/<matrix-id>/` containing `matrix-manifest.json`,
 per-run raw artifacts under `runs/`, and analysis-ready `analysis.json` and
-`analysis.csv`. `condition-summary.csv` gives one row per condition/workload with mean and minimum `success_rate_percent`, achieved RPS, generator-drop rate, p95 latency, and completed/saturated counts. Therefore conventional success rate is explicit both per-run in `analysis.csv`/`stress-test.csv` and per-workload in `condition-summary.csv`. When `INTERNAL_OBSERVABILITY=true`, `internal-observability-summary.csv` also aggregates wrapper, serialization, submission-initiation, queue, worker, reconstruction, business p95, and request p95 metrics per condition/workload. The flat analysis files include only valid measurements. Rejected
+`analysis.csv`. `primary_results.csv` contains only valid, non-saturated, diagnostic-off runs for direct primary comparison. `observability_results.csv` contains the tracing-pipeline fields, and `run_validation.csv` contains validity, saturation, comparison eligibility, and reasons. `condition-summary.csv` gives one row per condition/workload with mean and minimum `success_rate_percent`, achieved RPS, generator-drop rate, p95 latency, and completed/saturated counts. Therefore conventional success rate is explicit both per-run in `analysis.csv`/`stress-test.csv` and per-workload in `condition-summary.csv`. When `INTERNAL_OBSERVABILITY=true`, `internal-observability-summary.csv` also aggregates wrapper, serialization, submission-initiation, queue, worker, reconstruction, business p95, and request p95 metrics per condition/workload. The flat analysis files include only valid measurements. Rejected
 runs are recorded separately in `failed-runs.csv` and the matrix manifest, with
 their error details. A run is rejected when it has no successful HTTP response or
 its transport-error rate exceeds 5%; the command continues to remaining runs,

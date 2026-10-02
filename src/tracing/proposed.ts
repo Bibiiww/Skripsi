@@ -29,17 +29,18 @@ function headerValue(value: string | string[] | undefined): string | undefined {
 }
 
 function emit(event: TraceEvent): void {
-  const serializeStarted = performance.now();
+  const diagnostic = internalObservabilityEnabled();
+  const serializeStarted = diagnostic ? performance.now() : 0;
   const body = JSON.stringify(event);
-  const serializationMs = performance.now() - serializeStarted;
-  if (internalObservabilityEnabled()) { increment("EVENT_CAPTURE", "events_produced"); addRequestValue("events_produced", 1); observeTiming("SERIALIZATION", "duration_ms", serializationMs); addRequestValue("serialization_duration_ms", serializationMs); increment("SERIALIZATION", "bytes", Buffer.byteLength(body)); }
+  const serializationMs = diagnostic ? performance.now() - serializeStarted : 0;
+  if (diagnostic) { increment("EVENT_CAPTURE", "events_produced"); addRequestValue("events_produced", 1); observeTiming("SERIALIZATION", "duration_ms", serializationMs); addRequestValue("serialization_duration_ms", serializationMs); increment("SERIALIZATION", "bytes", Buffer.byteLength(body)); }
   // Intentionally not awaited: bounded queue submission is off the request path.
-  const submissionStarted = performance.now();
+  const submissionStarted = diagnostic ? performance.now() : 0;
   let pending: Promise<Response>;
   try { pending = fetch(`${queueUrl}/v1/events`, { method: "POST", headers: { "content-type": "application/json" }, body }); }
   catch { increment("EVENT_SUBMISSION", "initiation_errors"); return; }
-  const initiationMs = performance.now() - submissionStarted;
-  if (internalObservabilityEnabled()) { increment("EVENT_SUBMISSION", "attempts"); increment("EVENT_SUBMISSION", "initiated"); increment("EVENT_SUBMISSION", "bytes", Buffer.byteLength(body)); observeTiming("EVENT_SUBMISSION", "init_duration_ms", initiationMs); addRequestValue("submission_init_duration_ms", initiationMs); }
+  const initiationMs = diagnostic ? performance.now() - submissionStarted : 0;
+  if (diagnostic) { increment("EVENT_SUBMISSION", "attempts"); increment("EVENT_SUBMISSION", "initiated"); increment("EVENT_SUBMISSION", "bytes", Buffer.byteLength(body)); observeTiming("EVENT_SUBMISSION", "init_duration_ms", initiationMs); addRequestValue("submission_init_duration_ms", initiationMs); }
   void pending.then(() => increment("EVENT_SUBMISSION", "completed")).catch(() => increment("EVENT_SUBMISSION", "errors"));
 }
 
@@ -60,13 +61,14 @@ export async function withProposedSpan<T>(
   execute: () => Promise<T>
 ): Promise<T> {
   if (!enabled) return execute();
-  const lookupStarted = performance.now(); const parent = storage.getStore(); observeTiming("CONTEXT", "lookup_ms", performance.now() - lookupStarted);
+  const diagnostic = internalObservabilityEnabled();
+  const lookupStarted = diagnostic ? performance.now() : 0; const parent = storage.getStore(); if (diagnostic) observeTiming("CONTEXT", "lookup_ms", performance.now() - lookupStarted);
   if (!parent) return execute();
-  const preStarted = performance.now(); const idStarted = performance.now(); const spanId = randomUUID(); observeTiming("WRAPPER", "span_id_generation_ms", performance.now() - idStarted);
-  const timestampStarted = performance.now(); const startTimestamp = new Date().toISOString(); observeTiming("WRAPPER", "timestamp_generation_ms", performance.now() - timestampStarted);
-  const entryStarted = performance.now(); const entry = { request_id: parent.requestId, span_id: spanId, parent_span_id: parent.currentSpanId, event_type: "ENTRY" as const, function_name: functionName, layer, service_name: serviceName, start_timestamp: startTimestamp, end_timestamp: null, outcome: null, event_created_at_ms: Date.now() }; const entryMs = performance.now() - entryStarted; increment("EVENT_CAPTURE", "entry_events"); observeTiming("EVENT_CAPTURE", "entry_event_creation_ms", entryMs); observeTiming("EVENT_CAPTURE", "duration_ms", entryMs); addRequestValue("capture_duration_ms", entryMs); emit(entry);
-  const preMs = performance.now() - preStarted; observeTiming("WRAPPER", "pre_ms", preMs);
-  const alsStarted = performance.now(); const result = storage.run({ requestId: parent.requestId, currentSpanId: spanId }, async () => {
+  const preStarted = diagnostic ? performance.now() : 0; const idStarted = diagnostic ? performance.now() : 0; const spanId = randomUUID(); if (diagnostic) observeTiming("WRAPPER", "span_id_generation_ms", performance.now() - idStarted);
+  const timestampStarted = diagnostic ? performance.now() : 0; const startTimestamp = new Date().toISOString(); if (diagnostic) observeTiming("WRAPPER", "timestamp_generation_ms", performance.now() - timestampStarted);
+  const entryStarted = diagnostic ? performance.now() : 0; const entry = { request_id: parent.requestId, span_id: spanId, parent_span_id: parent.currentSpanId, event_type: "ENTRY" as const, function_name: functionName, layer, service_name: serviceName, start_timestamp: startTimestamp, end_timestamp: null, outcome: null, event_created_at_ms: diagnostic ? Date.now() : undefined }; const entryMs = diagnostic ? performance.now() - entryStarted : 0; if (diagnostic) { increment("EVENT_CAPTURE", "entry_events"); observeTiming("EVENT_CAPTURE", "entry_event_creation_ms", entryMs); observeTiming("EVENT_CAPTURE", "duration_ms", entryMs); addRequestValue("capture_duration_ms", entryMs); } emit(entry);
+  const preMs = diagnostic ? performance.now() - preStarted : 0; if (diagnostic) observeTiming("WRAPPER", "pre_ms", preMs);
+  const alsStarted = diagnostic ? performance.now() : 0; const result = storage.run({ requestId: parent.requestId, currentSpanId: spanId }, async () => {
     let outcome: TraceEvent["outcome"] = "ok";
     try {
       return await execute();
@@ -74,9 +76,9 @@ export async function withProposedSpan<T>(
       outcome = "error";
       throw error;
     } finally {
-      const postStarted = performance.now(); const exitStarted = performance.now(); const exit = { request_id: parent.requestId, span_id: spanId, parent_span_id: parent.currentSpanId, event_type: "EXIT" as const, function_name: functionName, layer, service_name: serviceName, start_timestamp: null, end_timestamp: new Date().toISOString(), outcome, event_created_at_ms: Date.now() }; const exitMs = performance.now() - exitStarted; increment("EVENT_CAPTURE", "exit_events"); observeTiming("EVENT_CAPTURE", "exit_event_creation_ms", exitMs); observeTiming("EVENT_CAPTURE", "duration_ms", exitMs); addRequestValue("capture_duration_ms", exitMs); emit(exit); const postMs = performance.now() - postStarted; observeTiming("WRAPPER", "post_ms", postMs); observeTiming("WRAPPER", "total_overhead_ms", preMs + postMs); addRequestValue("wrapper_duration_ms", preMs + postMs);
+      const postStarted = diagnostic ? performance.now() : 0; const exitStarted = diagnostic ? performance.now() : 0; const exit = { request_id: parent.requestId, span_id: spanId, parent_span_id: parent.currentSpanId, event_type: "EXIT" as const, function_name: functionName, layer, service_name: serviceName, start_timestamp: null, end_timestamp: new Date().toISOString(), outcome, event_created_at_ms: diagnostic ? Date.now() : undefined }; const exitMs = diagnostic ? performance.now() - exitStarted : 0; if (diagnostic) { increment("EVENT_CAPTURE", "exit_events"); observeTiming("EVENT_CAPTURE", "exit_event_creation_ms", exitMs); observeTiming("EVENT_CAPTURE", "duration_ms", exitMs); addRequestValue("capture_duration_ms", exitMs); } emit(exit); const postMs = diagnostic ? performance.now() - postStarted : 0; if (diagnostic) { observeTiming("WRAPPER", "post_ms", postMs); observeTiming("WRAPPER", "total_overhead_ms", preMs + postMs); addRequestValue("wrapper_duration_ms", preMs + postMs); }
     }
-  }); observeTiming("WRAPPER", "async_local_storage_run_ms", performance.now() - alsStarted); return result;
+  }); if (diagnostic) observeTiming("WRAPPER", "async_local_storage_run_ms", performance.now() - alsStarted); return result;
 }
 
 export async function runProposedRequest<T>(

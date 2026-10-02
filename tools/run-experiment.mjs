@@ -122,6 +122,8 @@ if (descriptor.workloadDescriptorVersion !== "1.0.0") throw new Error("Unsupport
 const runId = `${new Date().toISOString().replace(/[:.]/g, "-")}-${condition}-${randomUUID().slice(0, 8)}`;
 const runDir = join(resultsDir, runId);
 await mkdir(runDir, { recursive: true });
+await mkdir(join(runDir, "primary"), { recursive: true });
+await mkdir(join(runDir, "observability"), { recursive: true });
 await copyFile(descriptorAbsolutePath, join(runDir, "workload.json"));
 
 const composeFiles = condition === "conventional"
@@ -132,9 +134,22 @@ const composeFiles = condition === "conventional"
 const ids = containerIds(project, composeFiles);
 const hostCapacity = dockerHostCapacity();
 const manifest = {
-  schemaVersion: "1.0.0", runId, condition, status: "running", startedAt: new Date().toISOString(),
+  schemaVersion: "2.0.0", runId, condition, status: "running", startedAt: new Date().toISOString(),
   descriptorId: descriptor.id, descriptorSha256: createHash("sha256").update(descriptorText).digest("hex"),
-  baseUrl, composeProject: project, composeFiles, containers: ids, hostCapacity, internalObservability, command: process.argv.slice(2)
+  baseUrl, composeProject: project, composeFiles, containers: ids, hostCapacity, internalObservability, command: process.argv.slice(2),
+  measurementBoundary: {
+    version: "gateway-business-boundary-v1",
+    requestLatency: "load-generator schedules request to complete HTTP response receipt",
+    businessLatency: "gateway immediately before buildQuote invocation to buildQuote resolution; includes all work that actually executes on this request critical path",
+    conventionalExport: "gateway-to-service client export is inside businessLatency; server-span export executes in Fastify onResponse after businessLatency and remains included in external requestLatency",
+    proposedInstrumentation: "wrapper context/UUID/timestamp/event construction/JSON serialization/fetch initiation execute on request critical path when reached; detached transport completion, queue, worker, and reconstruction are outside businessLatency",
+    asynchronousObservability: "post-submission queue admission/worker/reconstruction, reported separately and never added to businessLatency"
+  },
+  measurementClassification: {
+    primary: ["request_latency", "business_latency", "achieved_rps", "successful_requests", "cpu", "memory"],
+    secondary: ["success_rate", "generator_drop_rate", "queue_drop_rate", "reconstruction_success_rate"],
+    diagnostic: ["wrapper", "event_capture", "serialization", "submission", "queue", "worker", "reconstruction"]
+  }
 };
 await writeFile(join(runDir, "manifest.json"), `${JSON.stringify(manifest, null, 2)}\n`);
 
@@ -167,12 +182,18 @@ try {
     : condition === "conventional"
       ? { gateway: `${baseUrl}/v1/internal-observability`, collector: "http://127.0.0.1:16686/v1/internal-observability" }
       : { gateway: `${baseUrl}/v1/internal-observability` };
+  const gatewayDiagnosticState = await json(internalUrls.gateway);
+  if (gatewayDiagnosticState.enabled !== internalObservability) throw new Error(`Diagnostic mode mismatch: runner requested INTERNAL_OBSERVABILITY=${internalObservability}, gateway reports ${gatewayDiagnosticState.enabled}. Restart the selected Compose stack with the same setting.`);
+  manifest.diagnosticModeVerified = gatewayDiagnosticState.enabled;
   if (internalObservability) { await resetInternal(internalUrls); resetContainerInternalMetrics(ids); }
 
   const child = spawn(process.execPath, ["tools/load-generator.mjs", "--descriptor", descriptorAbsolutePath, "--base-url", baseUrl, "--skip-warmup", "--output", join(runDir, "http-summary.json")], { stdio: "inherit" });
   await waitForChild(child);
   const http = JSON.parse(await readFile(join(runDir, "http-summary.json"), "utf8"));
-  await writeFile(join(runDir, "latency.json"), `${JSON.stringify({ request_latency: http.latencyMs, business_duration: http.businessProcessingMs, achieved_rps: http.achievedRps }, null, 2)}\n`);
+  const primaryPerformance = { schemaVersion: "1.0.0", measurementBoundary: manifest.measurementBoundary.version, condition, workload_id: descriptor.id, run_id: runId, achieved_rps: http.achievedRps, successful_requests: http.successfulRequests, request_latency_ms: http.latencyMs, business_latency_ms: http.businessProcessingMs };
+  await writeFile(join(runDir, "latency.json"), `${JSON.stringify(primaryPerformance, null, 2)}\n`);
+  await writeFile(join(runDir, "primary", "performance.json"), `${JSON.stringify(primaryPerformance, null, 2)}\n`);
+  await writeFile(join(runDir, "primary", "latency.csv"), `condition,workload_id,run_id,achieved_rps,successful_requests,request_latency_mean_ms,request_latency_p50_ms,request_latency_p95_ms,request_latency_p99_ms,business_latency_mean_ms,business_latency_p50_ms,business_latency_p95_ms,business_latency_p99_ms\n${condition},${descriptor.id},${runId},${http.achievedRps},${http.successfulRequests},${http.latencyMs.mean},${http.latencyMs.p50},${http.latencyMs.p95},${http.latencyMs.p99},${http.businessProcessingMs.mean},${http.businessProcessingMs.p50},${http.businessProcessingMs.p95},${http.businessProcessingMs.p99}\n`);
   const successRatePercent = http.scheduledRequests ? (http.successfulRequests / http.scheduledRequests) * 100 : 0;
   const generatorDropRatePercent = http.scheduledRequests ? (http.generatorDrops / http.scheduledRequests) * 100 : 0;
   const achievedTargetRatePercent = descriptor.request.rateRps ? (http.achievedRps / descriptor.request.rateRps) * 100 : 0;
@@ -185,6 +206,7 @@ try {
     achievedTargetRatePercent,
     saturationThresholdPercent
   };
+  let saturationSignals = [];
   if (condition === "proposed") {
     const drain = await waitForProposedDrain(queueMetricsUrl, reconstructionMetricsUrl, traceDrainTimeoutSeconds);
     const queue = delta(drain.queue, proposedBefore.queue, ["accepted", "dropped", "queued", "dequeued"]);
@@ -200,6 +222,11 @@ try {
       reconstructionSuccessRatePercent: expectedRequests ? (reconstruction.completeTraces / expectedRequests) * 100 : null
     };
     await writeFile(join(runDir, "tracing-metrics.json"), `${JSON.stringify(metrics, null, 2)}\n`);
+    await writeFile(join(runDir, "observability", "events.json"), `${JSON.stringify(metrics.events, null, 2)}\n`);
+    await writeFile(join(runDir, "observability", "queue.json"), `${JSON.stringify({ queue: metrics.queue, queueDropRatePercent: metrics.queueDropRatePercent }, null, 2)}\n`);
+    await writeFile(join(runDir, "observability", "reconstruction.json"), `${JSON.stringify({ reconstruction: metrics.reconstruction, reconstructionSuccessRatePercent: metrics.reconstructionSuccessRatePercent }, null, 2)}\n`);
+    if (queue.dropped > 0) saturationSignals.push("queue_drops_observed");
+    if (!drain.drained) saturationSignals.push("async_pipeline_not_drained");
   }
   if (internalObservability) {
     const exposedServices = await internalSnapshot(internalUrls);
@@ -233,8 +260,28 @@ try {
       correlation: { target_rps: descriptor.request.rateRps, achieved_rps: http.achievedRps, computational_signature: descriptor.computational?.signature ?? null, structural_signature: descriptor.structural?.signature ?? null, input_size: descriptor.inputSize ?? descriptor.computational?.inputSize ?? null, events_per_request: http.successfulRequests ? eventsProduced / http.successfulRequests : null, queue_wait_p95: timing(queueService, "QUEUE.wait_ms").p95, request_p95: http.latencyMs?.p95, request_p99: http.latencyMs?.p99, business_p95: http.businessProcessingMs?.p95 }
     };
     await writeFile(join(runDir, "internal-observability.json"), `${JSON.stringify(internal, null, 2)}\n`);
+    await writeFile(join(runDir, "observability", "instrumentation.json"), `${JSON.stringify(internal, null, 2)}\n`);
   }
-  const isSaturated = successRatePercent < saturationThresholdPercent || achievedTargetRatePercent < saturationThresholdPercent;
+  if (successRatePercent < saturationThresholdPercent) saturationSignals.push("success_rate_below_threshold");
+  if (achievedTargetRatePercent < saturationThresholdPercent) saturationSignals.push("achieved_rps_below_threshold");
+  const isSaturated = saturationSignals.length > 0;
+  const diagnosticArtifactPresent = Boolean(await readFile(join(runDir, "internal-observability.json"), "utf8").catch(() => null));
+  manifest.measurementValidation = {
+    ...manifest.measurementValidation,
+    measurementBoundaryValid: true,
+    workloadConsistent: true,
+    conditionValid: true,
+    diagnosticModeConsistent: manifest.diagnosticModeVerified === internalObservability,
+    primaryMetricsComplete: [http.latencyMs, http.businessProcessingMs].every((metric) => metric?.samples > 0 && Number.isFinite(metric.mean) && Number.isFinite(metric.p95)),
+    observabilityMetricsComplete: !internalObservability || diagnosticArtifactPresent,
+    diagnosticInstrumentationEnabled: internalObservability,
+    diagnosticArtifactsAbsent: internalObservability || !diagnosticArtifactPresent,
+    comparisonEligible: !internalObservability,
+    saturated: isSaturated,
+    saturationSignals,
+    valid: null,
+    invalidReasons: []
+  };
   manifest.measurementValidation.classification = isSaturated ? "saturated" : "completed";
   manifest.status = isSaturated ? "saturated" : "completed";
 } catch (error) {
@@ -246,8 +293,23 @@ try {
   sample();
   manifest.finishedAt = new Date().toISOString();
   manifest.resourceSamplingError = samplingError;
-  await writeFile(join(runDir, "container-metrics.json"), `${JSON.stringify({ schemaVersion: "1.0.0", intervalSeconds: 1, samples }, null, 2)}\n`);
-  await writeFile(join(runDir, "resource.json"), `${JSON.stringify({ schemaVersion: "1.0.0", intervalSeconds: 1, samples }, null, 2)}\n`);
+  const resourceArtifact = { schemaVersion: "1.0.0", intervalSeconds: 1, samples };
+  const primaryMetricsComplete = Boolean(manifest.measurementValidation?.primaryMetricsComplete);
+  const resourceMetricsComplete = samples.length >= 2 && !samplingError;
+  if (manifest.measurementValidation) {
+    manifest.measurementValidation.resourceMetricsComplete = resourceMetricsComplete;
+    manifest.measurementValidation.valid = manifest.status !== "failed" && primaryMetricsComplete && resourceMetricsComplete && manifest.measurementValidation.measurementBoundaryValid && manifest.measurementValidation.workloadConsistent && manifest.measurementValidation.conditionValid && manifest.measurementValidation.diagnosticModeConsistent && manifest.measurementValidation.diagnosticArtifactsAbsent;
+    manifest.measurementValidation.invalidReasons = [
+      ...(primaryMetricsComplete ? [] : ["primary_metrics_missing"]),
+      ...(resourceMetricsComplete ? [] : [samplingError ? "resource_sampling_error" : "insufficient_resource_samples"]),
+      ...(manifest.measurementValidation.observabilityMetricsComplete === false ? ["diagnostic_artifact_missing"] : []),
+      ...(manifest.measurementValidation.diagnosticArtifactsAbsent === false ? ["diagnostic_artifact_present_in_primary_mode"] : [])
+    ];
+  }
+  await writeFile(join(runDir, "container-metrics.json"), `${JSON.stringify(resourceArtifact, null, 2)}\n`);
+  await writeFile(join(runDir, "resource.json"), `${JSON.stringify(resourceArtifact, null, 2)}\n`);
+  await writeFile(join(runDir, "primary", "resource.json"), `${JSON.stringify(resourceArtifact, null, 2)}\n`);
+  await writeFile(join(runDir, "primary", "resource.csv"), `run_id,condition,resource_sample_count,resource_sampling_error\n${runId},${condition},${samples.length},${samplingError ? JSON.stringify(samplingError) : ""}\n`);
   await writeFile(join(runDir, "manifest.json"), `${JSON.stringify(manifest, null, 2)}\n`);
 }
 console.log(`Experiment complete: ${runDir}`);
