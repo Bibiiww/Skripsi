@@ -625,6 +625,10 @@ class BoundedEventQueue {
   get size() {
     return this.events.length;
   }
+
+  snapshot() {
+    return this.events.slice();
+  }
 }
 
 /* -------------------------------------------------------------------------- */
@@ -1180,7 +1184,10 @@ function profileProposed(
 
   return {
     metrics,
-    queue
+    queue,
+    queueEvents: queue.snapshot(),
+    queueAccepted: queue.accepted,
+    queueDropped: queue.dropped
   };
 }
 
@@ -1250,9 +1257,10 @@ function validateReconstruction(
 /* -------------------------------------------------------------------------- */
 
 function profileAsyncTail(
-  queue,
+  events,
   batchSize,
-  expectedSpanCount
+  expectedSpanCount,
+  queueDropped = 0
 ) {
   const metrics = createMetrics();
 
@@ -1263,11 +1271,42 @@ function profileAsyncTail(
     expectedSpanCount *
     PROPOSED_EVENTS_PER_SPAN;
 
-  const totalTraces =
-    Math.floor(
-      queue.size /
-      eventsPerTrace
+  /*
+   * IMPORTANT:
+   * Every batch-size experiment receives the SAME immutable snapshot
+   * of accepted queue events. This prevents batch_size=100 from consuming
+   * the events before batch_size=1000 and 10000 are measured.
+   *
+   * A fresh local queue is created for each batch-size run. Events are
+   * preloaded without measuring enqueue time because enqueue was already
+   * measured on the producer/request path.
+   */
+  const queue =
+    new BoundedEventQueue(
+      Math.max(events.length, 1)
     );
+
+  queue.events = events.slice();
+  queue.accepted = events.length;
+  queue.dropped = queueDropped;
+
+  const totalProducedEvents =
+    events.length + queueDropped;
+
+  const totalInputTraces =
+    totalProducedEvents > 0
+      ? Math.ceil(
+          totalProducedEvents /
+          eventsPerTrace
+        )
+      : 0;
+
+  /*
+   * The reconstruction worker keeps partial traces across dequeue batches.
+   * This is important because a batch boundary may occur between ENTRY and
+   * EXIT events belonging to the same request.
+   */
+  const pendingTraces = new Map();
 
   while (queue.size > 0) {
     const dequeueStarted =
@@ -1284,52 +1323,53 @@ function profileAsyncTail(
         dequeueStarted
     );
 
-    /*
-     * Group events by request_id so reconstruction operates
-     * on complete traces when possible.
-     */
-    const tracesByRequest =
-      new Map();
+    const reconstructionStarted =
+      performance.now();
 
     for (
       const event of
       dequeued.events
     ) {
       let trace =
-        tracesByRequest.get(
+        pendingTraces.get(
           event.request_id
         );
 
       if (!trace) {
         trace = [];
-        tracesByRequest.set(
+        pendingTraces.set(
           event.request_id,
           trace
         );
       }
 
       trace.push(event);
-    }
 
-    const reconstructionStarted =
-      performance.now();
-
-    for (
-      const trace of
-      tracesByRequest.values()
-    ) {
-      const reconstructed =
-        reconstruct(trace);
-
+      /*
+       * A complete trace contains exactly all expected ENTRY/EXIT events.
+       * Reconstruct immediately when the complete event set is available.
+       */
       if (
-        validateReconstruction(
-          reconstructed,
-          expectedSpanCount
-        )
+        trace.length >= eventsPerTrace
       ) {
-        successfulTraces += 1;
-      } else {
-        failedTraces += 1;
+        const reconstructed =
+          reconstruct(trace);
+
+        if (
+          validateReconstruction(
+            reconstructed,
+            expectedSpanCount
+          ) &&
+          trace.length === eventsPerTrace
+        ) {
+          successfulTraces += 1;
+        } else {
+          failedTraces += 1;
+        }
+
+        pendingTraces.delete(
+          event.request_id
+        );
       }
     }
 
@@ -1338,6 +1378,35 @@ function profileAsyncTail(
         reconstructionStarted
     );
   }
+
+  /*
+   * Any trace left in pendingTraces is incomplete. This can happen when
+   * queue capacity caused event drops. Each incomplete request counts as
+   * one failed reconstruction.
+   */
+  for (
+    const trace of
+    pendingTraces.values()
+  ) {
+    const reconstructed =
+      reconstruct(trace);
+
+    if (
+      validateReconstruction(
+        reconstructed,
+        expectedSpanCount
+      ) &&
+      trace.length === eventsPerTrace
+    ) {
+      successfulTraces += 1;
+    } else {
+      failedTraces += 1;
+    }
+  }
+
+  const totalReconstructedTraces =
+    successfulTraces +
+    failedTraces;
 
   const dequeueTotal =
     metrics.queue_dequeue.reduce(
@@ -1362,16 +1431,17 @@ function profileAsyncTail(
     metrics,
     successfulTraces,
     failedTraces,
-    totalTraces,
+    totalTraces:
+      totalReconstructedTraces,
+    totalInputTraces,
     reconstructionSuccessRate:
-      totalTraces
+      totalReconstructedTraces
         ? successfulTraces /
-          totalTraces
+          totalReconstructedTraces
         : 0,
     queueAccepted:
-      queue.accepted,
-    queueDropped:
-      queue.dropped,
+      events.length,
+    queueDropped,
     queueRemaining:
       queue.size
   };
@@ -1577,7 +1647,7 @@ async function main() {
   );
 
   console.log(
-    "Tracing Profiling V4 - Topology Aware"
+    "Tracing Profiling V4.1 - Topology Aware"
   );
 
   console.log(
@@ -1751,9 +1821,10 @@ async function main() {
            */
           const tail =
             profileAsyncTail(
-              result.queue,
+              result.queueEvents,
               batchSize,
-              PROPOSED_SPANS.length
+              PROPOSED_SPANS.length,
+              result.queueDropped
             );
 
           rows.push(
