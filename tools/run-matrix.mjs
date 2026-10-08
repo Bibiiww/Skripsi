@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+// run-matrix.js
 import { mkdir, readdir, readFile, writeFile } from "node:fs/promises";
 import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
