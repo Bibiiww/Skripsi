@@ -5,11 +5,13 @@ import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { basename, join, resolve } from "node:path";
 
-const conditionsAllowed = ["baseline", "conventional", "proposed"];
+const conditionsAllowed = ["baseline", "conventional", "proposed", "proposed-memory", "proposed-durable"];
 const composeFiles = {
   baseline: ["compose.yaml"],
   conventional: ["compose.yaml", "compose.conventional.yaml"],
-  proposed: ["compose.yaml", "compose.proposed.yaml"]
+  proposed: ["compose.yaml", "compose.proposed.yaml"],
+  "proposed-memory": ["compose.yaml", "compose.proposed-memory.yaml"],
+  "proposed-durable": ["compose.yaml", "compose.proposed-durable.yaml"]
 };
 
 function option(name, fallback) {
@@ -243,7 +245,7 @@ function validationRecord(record) {
 }
 
 const conditions = (option("--conditions", conditionsAllowed.join(","))).split(",").map((value) => value.trim()).filter(Boolean);
-if (!conditions.length || conditions.some((condition) => !conditionsAllowed.includes(condition))) throw new Error("--conditions must contain baseline, conventional, and/or proposed.");
+if (!conditions.length || conditions.some((condition) => !conditionsAllowed.includes(condition))) throw new Error("--conditions must use one or more documented conditions.");
 const repetitions = Number(option("--repetitions", "1"));
 if (!Number.isInteger(repetitions) || repetitions < 1) throw new Error("--repetitions must be a positive integer.");
 const cooldownSeconds = Number(option("--cooldown-seconds", "5"));

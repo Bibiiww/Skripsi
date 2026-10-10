@@ -1,0 +1,47 @@
+# C3: same record format and batching as C2, with asynchronous group commits to a local WAL.
+services:
+  gateway: &durable-service
+    environment:
+      TRACING_MODE: proposed-durable
+      TRACE_QUEUE_URL: http://trace-event-queue:3000
+      TRACE_LOCAL_BUFFER_CAPACITY: ${TRACE_LOCAL_BUFFER_CAPACITY:-10000}
+      TRACE_BATCH_SIZE: ${TRACE_BATCH_SIZE:-200}
+      TRACE_FLUSH_INTERVAL_MS: ${TRACE_FLUSH_INTERVAL_MS:-100}
+      TRACE_WAL_PATH: /var/lib/tracing/execution.wal
+    volumes: [gateway-trace-wal:/var/lib/tracing]
+    depends_on:
+      trace-event-queue:
+        condition: service_healthy
+  catalog:
+    <<: *durable-service
+    volumes: [catalog-trace-wal:/var/lib/tracing]
+  inventory:
+    <<: *durable-service
+    volumes: [inventory-trace-wal:/var/lib/tracing]
+  trace-event-queue:
+    build: .
+    environment:
+      SERVICE_ROLE: trace-event-queue
+      PORT: 3000
+      TRACE_QUEUE_CAPACITY: ${TRACE_QUEUE_CAPACITY:-10000}
+    ports: ["16686:3000"]
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://localhost:3000/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+  trace-reconstruction-worker:
+    build: .
+    environment:
+      SERVICE_ROLE: trace-reconstruction-worker
+      PORT: 3000
+      TRACE_QUEUE_URL: http://trace-event-queue:3000
+      TRACE_WORKER_POLL_INTERVAL_MS: ${TRACE_WORKER_POLL_INTERVAL_MS:-100}
+    ports: ["16687:3000"]
+    depends_on:
+      trace-event-queue:
+        condition: service_healthy
+volumes:
+  gateway-trace-wal:
+  catalog-trace-wal:
+  inventory-trace-wal:

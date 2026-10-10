@@ -111,9 +111,12 @@ const reconstructionMetricsUrl = option("--reconstruction-metrics-url", "http://
 const traceDrainTimeoutSeconds = Number(option("--trace-drain-timeout-seconds", "30"));
 const saturationThresholdPercent = Number(option("--saturation-threshold-percent", "95"));
 const internalObservability = option("--internal-observability", process.env.INTERNAL_OBSERVABILITY ?? "false") === "true";
-if (!descriptorPath || !condition) throw new Error("Usage: node tools/run-experiment.mjs --descriptor FILE --condition baseline|conventional|proposed [--base-url URL]");
-if (!["baseline", "conventional", "proposed"].includes(condition)) throw new Error("condition must be baseline, conventional, or proposed");
+if (!descriptorPath || !condition) throw new Error("Usage: node tools/run-experiment.mjs --descriptor FILE --condition baseline|conventional|proposed|proposed-memory|proposed-durable [--base-url URL]");
+if (!["baseline", "conventional", "proposed", "proposed-memory", "proposed-durable"].includes(condition)) throw new Error("condition must be baseline, conventional, proposed, proposed-memory, or proposed-durable");
 if (!Number.isFinite(saturationThresholdPercent) || saturationThresholdPercent <= 0 || saturationThresholdPercent > 100) throw new Error("--saturation-threshold-percent must be greater than 0 and at most 100.");
+const recordMode = condition === "proposed-memory" || condition === "proposed-durable";
+const selectedQueueMetricsUrl = recordMode ? queueMetricsUrl.replace(/\/v1\/metrics$/, "/v2/metrics") : queueMetricsUrl;
+const selectedReconstructionMetricsUrl = recordMode ? reconstructionMetricsUrl.replace(/\/v1\/metrics$/, "/v2/metrics") : reconstructionMetricsUrl;
 
 const descriptorAbsolutePath = resolve(descriptorPath);
 const descriptorText = await readFile(descriptorAbsolutePath, "utf8");
@@ -128,8 +131,9 @@ await copyFile(descriptorAbsolutePath, join(runDir, "workload.json"));
 
 const composeFiles = condition === "conventional"
   ? ["compose.yaml", "compose.conventional.yaml"]
-  : condition === "proposed"
-    ? ["compose.yaml", "compose.proposed.yaml"]
+  : condition === "proposed" ? ["compose.yaml", "compose.proposed.yaml"]
+  : condition === "proposed-memory" ? ["compose.yaml", "compose.proposed-memory.yaml"]
+  : condition === "proposed-durable" ? ["compose.yaml", "compose.proposed-durable.yaml"]
     : ["compose.yaml"];
 const ids = containerIds(project, composeFiles);
 const hostCapacity = dockerHostCapacity();
@@ -172,12 +176,12 @@ try {
   await waitForChild(warmupChild);
 
   let proposedBefore;
-  if (condition === "proposed") {
-    const settled = await waitForProposedDrain(queueMetricsUrl, reconstructionMetricsUrl, traceDrainTimeoutSeconds);
+  if (condition === "proposed" || recordMode) {
+    const settled = await waitForProposedDrain(selectedQueueMetricsUrl, selectedReconstructionMetricsUrl, traceDrainTimeoutSeconds);
     if (!settled.drained) throw new Error("Could not drain proposed tracing events after warm-up; measurement was not started.");
     proposedBefore = { queue: settled.queue, reconstruction: settled.reconstruction };
   }
-  const internalUrls = condition === "proposed"
+  const internalUrls = condition === "proposed" || recordMode
     ? { gateway: `${baseUrl}/v1/internal-observability`, queue: "http://127.0.0.1:16686/v1/internal-observability", worker: "http://127.0.0.1:16687/v1/internal-observability" }
     : condition === "conventional"
       ? { gateway: `${baseUrl}/v1/internal-observability`, collector: "http://127.0.0.1:16686/v1/internal-observability" }
@@ -207,19 +211,20 @@ try {
     saturationThresholdPercent
   };
   let saturationSignals = [];
-  if (condition === "proposed") {
-    const drain = await waitForProposedDrain(queueMetricsUrl, reconstructionMetricsUrl, traceDrainTimeoutSeconds);
-    const queue = delta(drain.queue, proposedBefore.queue, ["accepted", "dropped", "queued", "dequeued"]);
-    const reconstruction = delta(drain.reconstruction, proposedBefore.reconstruction, ["observedRequests", "completeTraces", "reconstructedSpans", "events", "incompleteSpans"]);
+  if (condition === "proposed" || recordMode) {
+    const drain = await waitForProposedDrain(selectedQueueMetricsUrl, selectedReconstructionMetricsUrl, traceDrainTimeoutSeconds);
+    const queue = delta(drain.queue, proposedBefore.queue, recordMode ? ["accepted", "dropped", "queued", "duplicates"] : ["accepted", "dropped", "queued", "dequeued"]);
+    const reconstruction = delta(drain.reconstruction, proposedBefore.reconstruction, recordMode ? ["observedTraces", "completeTraces", "reconstructedSpans"] : ["observedRequests", "completeTraces", "reconstructedSpans", "events", "incompleteSpans"]);
     const expectedRequests = http.successfulRequests;
     const eventsProduced = queue.accepted + queue.dropped;
     const metrics = {
       schemaVersion: "1.1.0", capturedAt: new Date().toISOString(), drained: drain.drained,
       measurementOnly: true, expectedRequests,
-      events: { produced: eventsProduced, enqueued: queue.accepted, dropped: queue.dropped, reconstructed: reconstruction.events },
+      events: { produced: eventsProduced, enqueued: queue.accepted, dropped: queue.dropped, reconstructed: recordMode ? reconstruction.reconstructedSpans : reconstruction.events },
       queue, reconstruction,
       queueDropRatePercent: eventsProduced ? (queue.dropped / eventsProduced) * 100 : null,
-      reconstructionSuccessRatePercent: expectedRequests ? (reconstruction.completeTraces / expectedRequests) * 100 : null
+      reconstructionSuccessRatePercent: expectedRequests ? (reconstruction.completeTraces / expectedRequests) * 100 : null,
+      ...(recordMode ? { tracingUnit: "execution_record", duplicateRecords: queue.duplicates } : {})
     };
     await writeFile(join(runDir, "tracing-metrics.json"), `${JSON.stringify(metrics, null, 2)}\n`);
     await writeFile(join(runDir, "observability", "events.json"), `${JSON.stringify(metrics.events, null, 2)}\n`);
@@ -235,7 +240,7 @@ try {
     const queueService = services.queue;
     const worker = services.worker;
     const collector = services.collector;
-    const queueMetrics = condition === "proposed" ? await json(queueMetricsUrl) : null;
+    const queueMetrics = condition === "proposed" || recordMode ? await json(selectedQueueMetricsUrl) : null;
     const collectorMetrics = condition === "conventional" ? await json("http://127.0.0.1:16686/v1/metrics") : null;
     const applicationServices = Object.fromEntries(Object.entries(services).filter(([name]) => ["gateway", "catalog", "inventory"].includes(name)));
     const eventsProduced = sumCounter(applicationServices, "EVENT_CAPTURE.events_produced");

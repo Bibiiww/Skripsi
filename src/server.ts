@@ -8,6 +8,9 @@ import { ConventionalTracer, type ActiveServerTrace, type TraceSpan } from "./tr
 import { currentProposedTraceId, runProposedRequest, type TraceEvent } from "./tracing/proposed.js";
 import { BoundedEventQueue } from "./tracing/queue.js";
 import { ReconstructionStore } from "./tracing/reconstruction.js";
+import { BoundedExecutionQueue } from "./tracing/execution-queue.js";
+import { ExecutionReconstructionStore } from "./tracing/execution-reconstruction.js";
+import type { ExecutionRecord } from "./tracing/async-execution.js";
 import { internalMetrics, observeBusiness, observeRequest, observeTiming, increment, resetInternalMetrics } from "./observability/internal.js";
 
 declare module "fastify" {
@@ -40,14 +43,24 @@ app.post("/v1/internal-observability/reset", async () => { resetInternalMetrics(
 
 if (role === "trace-event-queue") {
   const queue = new BoundedEventQueue(Number(process.env.TRACE_QUEUE_CAPACITY ?? 10000));
+  const executionQueue = new BoundedExecutionQueue(Number(process.env.TRACE_QUEUE_CAPACITY ?? 10000));
   app.post<{ Body: TraceEvent }>("/v1/events", async (request, reply) => {
     return queue.enqueue(request.body) ? reply.code(202).send({ accepted: true }) : reply.code(429).send({ accepted: false, reason: "queue_full" });
   });
   app.post<{ Body: { limit?: number } }>("/v1/events/dequeue", async (request) => ({ events: queue.dequeue(request.body?.limit ?? 100) }));
   app.get("/v1/metrics", async () => queue.metrics());
+  app.post<{ Body: { records?: ExecutionRecord[] } }>("/v2/records", async (request, reply) => {
+    const result = executionQueue.enqueue(request.body?.records ?? []);
+    return reply.code(result.dropped ? 429 : 202).send(result);
+  });
+  app.post<{ Body: { limit?: number } }>("/v2/records/dequeue", async (request) => ({ records: executionQueue.dequeue(request.body?.limit ?? 100) }));
+  app.get("/v2/metrics", async () => executionQueue.metrics());
 } else if (role === "trace-reconstruction-worker") {
   const store = new ReconstructionStore();
+  const executionStore = new ExecutionReconstructionStore();
   app.get("/v1/metrics", async () => store.summary());
+  app.get("/v2/metrics", async () => executionStore.summary());
+  app.get<{ Params: { traceId: string } }>("/v2/traces/:traceId", async (request, reply) => executionStore.get(request.params.traceId) ?? reply.code(404).send({ error: "trace_not_found" }));
   app.get<{ Params: { requestId: string } }>("/v1/traces/:requestId", async (request, reply) => {
     const trace = store.get(request.params.requestId);
     return trace ? trace : reply.code(404).send({ error: "trace_not_found" });
@@ -67,6 +80,8 @@ if (role === "trace-event-queue") {
         observeTiming("WORKER", "processing_duration_ms", performance.now() - processingStarted);
         observeTiming("WORKER", "batch_duration_ms", performance.now() - pollStarted); increment("WORKER", "events_processed", events.length);
       }
+      const executionResponse = await fetch(`${workerQueueUrl}/v2/records/dequeue`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ limit: 200 }) });
+      if (executionResponse.ok) executionStore.accept((await executionResponse.json() as { records: ExecutionRecord[] }).records);
     } catch { /* queue not ready; next poll retries */ }
     finally { lastPollFinished = performance.now(); }
   };

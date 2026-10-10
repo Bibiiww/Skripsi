@@ -1,0 +1,38 @@
+# C2: system-level asynchronous tracing with bounded per-service RAM buffers.
+# It intentionally does not modify the legacy compose.proposed.yaml condition.
+services:
+  gateway: &memory-service
+    environment:
+      TRACING_MODE: proposed-memory
+      TRACE_QUEUE_URL: http://trace-event-queue:3000
+      TRACE_LOCAL_BUFFER_CAPACITY: ${TRACE_LOCAL_BUFFER_CAPACITY:-10000}
+      TRACE_BATCH_SIZE: ${TRACE_BATCH_SIZE:-200}
+      TRACE_FLUSH_INTERVAL_MS: ${TRACE_FLUSH_INTERVAL_MS:-100}
+    depends_on:
+      trace-event-queue:
+        condition: service_healthy
+  catalog: *memory-service
+  inventory: *memory-service
+  trace-event-queue:
+    build: .
+    environment:
+      SERVICE_ROLE: trace-event-queue
+      PORT: 3000
+      TRACE_QUEUE_CAPACITY: ${TRACE_QUEUE_CAPACITY:-10000}
+    ports: ["16686:3000"]
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://localhost:3000/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+  trace-reconstruction-worker:
+    build: .
+    environment:
+      SERVICE_ROLE: trace-reconstruction-worker
+      PORT: 3000
+      TRACE_QUEUE_URL: http://trace-event-queue:3000
+      TRACE_WORKER_POLL_INTERVAL_MS: ${TRACE_WORKER_POLL_INTERVAL_MS:-100}
+    ports: ["16687:3000"]
+    depends_on:
+      trace-event-queue:
+        condition: service_healthy

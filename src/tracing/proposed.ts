@@ -2,6 +2,7 @@ import { AsyncLocalStorage } from "node:async_hooks";
 import { randomUUID } from "node:crypto";
 import { performance } from "node:perf_hooks";
 import { addRequestValue, increment, internalObservabilityEnabled, observeTiming } from "../observability/internal.js";
+import { addTraceAttribute as addExecutionTraceAttribute, addTraceEvent as addExecutionTraceEvent, currentExecutionTraceId, executionTraceHeaders, isAsyncExecutionTracing, runExecutionRequest, withExecutionRecord } from "./async-execution.js";
 
 export type ProposedTraceContext = { requestId: string; currentSpanId: string | null };
 export type TraceEvent = {
@@ -19,6 +20,8 @@ export type TraceEvent = {
   event_enqueued_at_ms?: number;
 };
 
+// The historical `proposed` mode is intentionally retained. New system-level
+// variants use one completion record and a local asynchronous publisher.
 const enabled = process.env.TRACING_MODE === "proposed";
 const serviceName = process.env.SERVICE_ROLE ?? "gateway";
 const queueUrl = process.env.TRACE_QUEUE_URL ?? "http://localhost:4319";
@@ -45,6 +48,7 @@ function emit(event: TraceEvent): void {
 }
 
 export function proposedTraceHeaders(): Record<string, string> | undefined {
+  if (isAsyncExecutionTracing()) return executionTraceHeaders();
   if (!enabled) return undefined;
   const context = storage.getStore();
   if (!context?.currentSpanId) return undefined;
@@ -52,6 +56,7 @@ export function proposedTraceHeaders(): Record<string, string> | undefined {
 }
 
 export function currentProposedTraceId(): string | undefined {
+  if (isAsyncExecutionTracing()) return currentExecutionTraceId();
   return enabled ? storage.getStore()?.requestId : undefined;
 }
 
@@ -60,6 +65,7 @@ export async function withProposedSpan<T>(
   layer: TraceEvent["layer"],
   execute: () => Promise<T>
 ): Promise<T> {
+  if (isAsyncExecutionTracing()) return withExecutionRecord(functionName, layer, execute);
   if (!enabled) return execute();
   const diagnostic = internalObservabilityEnabled();
   const lookupStarted = diagnostic ? performance.now() : 0; const parent = storage.getStore(); if (diagnostic) observeTiming("CONTEXT", "lookup_ms", performance.now() - lookupStarted);
@@ -86,8 +92,19 @@ export async function runProposedRequest<T>(
   operation: string,
   execute: () => Promise<T>
 ): Promise<T> {
+  if (isAsyncExecutionTracing()) return runExecutionRequest(headers, operation, execute);
   if (!enabled) return execute();
   const requestId = headerValue(headers["x-trace-id"]) ?? randomUUID();
   const parentSpanId = headerValue(headers["x-parent-span-id"]) ?? null;
   return storage.run({ requestId, currentSpanId: parentSpanId }, () => withProposedSpan(operation, "handler", execute));
+}
+
+/** Optional application-level enrichment; it follows the same async record path. */
+export function addProposedTraceAttribute(key: string, value: string | number | boolean): void {
+  addExecutionTraceAttribute(key, value);
+}
+
+/** Optional application-level event; do not put credentials or business payloads here. */
+export function addProposedTraceEvent(name: string, attributes?: Record<string, string | number | boolean>): void {
+  addExecutionTraceEvent(name, attributes);
 }

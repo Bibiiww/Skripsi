@@ -2,6 +2,8 @@
 
 Reproducible microservices benchmark for the thesis **"Perancangan Context-Aware Function-Level Tracing untuk Meningkatkan Observabilitas Internal pada Arsitektur Microservices dengan Pendekatan Asynchronous Event Processing"**.
 
+Untuk menjalankan dataset komparatif terbaru C0–C3 dan memilih data yang layak dianalisis, baca [README-COMPARATIVE-BENCHMARK.md](README-COMPARATIVE-BENCHMARK.md).
+
 ## Current stage: audit-ready benchmark
 
 This repository contains a small, deterministic three-service application with isolated comparison conditions:
@@ -270,3 +272,39 @@ node tools/run-matrix.mjs --base-url http://127.0.0.1:8080
 ## Next implementation stages
 
 1. Add automated experiment-matrix execution and analysis-ready CSV/JSON results.
+# System-level asynchronous tracing variants
+
+The historical `proposed` condition remains unchanged. For the refactored
+system-level variants, use the following explicit conditions:
+
+```powershell
+# C2: bounded in-memory record buffer and asynchronous batches
+docker compose -f compose.yaml -f compose.proposed-memory.yaml up --build --detach --wait
+node tools/run-experiment.mjs --descriptor workloads/v1/o1-shallow-low.json --condition proposed-memory
+
+# C3: same record contract, plus asynchronous local WAL group commits
+docker compose -f compose.yaml -f compose.proposed-durable.yaml up --build --detach --wait
+node tools/run-experiment.mjs --descriptor workloads/v1/o1-shallow-low.json --condition proposed-durable
+```
+
+Use the same workload descriptor, warm-up, duration, Docker allocation, and
+load-generator policy when comparing C0 (`baseline`), C1 (`conventional`), C2,
+and C3. Do not merge their historical and refactored results into one aggregate.
+
+`proposed-memory` captures one completion `ExecutionRecord` per selected
+function boundary. Record admission is synchronous and bounded; batch JSON
+serialization and HTTP transport are background work. `proposed-durable` first
+writes records with an asynchronous group commit to `/var/lib/tracing` and
+replays unacknowledged records after a producer restart. A record created before
+the next group commit can still be lost in a crash; queue acknowledgement does
+not prove reconstruction.
+
+Run the refactored conditions in the matrix runner with:
+
+```powershell
+node tools/run-matrix.mjs --conditions baseline,conventional,proposed-memory,proposed-durable --measurement-mode primary
+```
+
+See `ASYNC_TRACING_AUDIT.md` for the audited boundaries, the protected V4.1
+artifact, and current limitations.
+
