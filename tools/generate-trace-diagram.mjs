@@ -8,7 +8,7 @@ if (!condition || !endpoint) throw new Error("Usage: node tools/generate-trace-d
 const escape = (value) => String(value).replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;").replaceAll('"', "&quot;");
 
 async function load() {
-  if (condition === "conventional") {
+  if (condition === "conventional" || condition === "conventional-otel") {
     const body = await fetch(`${endpoint}/v1/spans`).then((response) => response.json());
     const groups = new Map(); for (const span of body.spans ?? []) groups.set(span.traceId, [...(groups.get(span.traceId) ?? []), span]);
     const traces = [...groups].map(([traceId, spans]) => ({ traceId, nodes: spans.map((span) => ({ id: span.spanId, parent: span.parentSpanId, label: `${span.serviceName}: ${span.operation}`, detail: `${span.kind} | ${span.statusCode ?? "?"}` })) }));

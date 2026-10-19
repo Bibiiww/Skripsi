@@ -12,6 +12,7 @@
     "load": "node tools/load-generator.mjs",
     "experiment": "node tools/run-experiment.mjs",
     "matrix": "node tools/run-matrix.mjs",
+    "fault-matrix": "node tools/run-fault-matrix.mjs",
     "charts": "node tools/generate-charts.mjs"
   },
   "engines": {

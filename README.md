@@ -189,22 +189,23 @@ Confirm that the new run folder contains `internal-observability.json` and that 
 
 ## Automated experiment matrix
 
-Use `run-experiment` for one condition and one descriptor. Use `run-matrix` to run every selected descriptor automatically. Collect the primary comparison dataset with diagnostic instrumentation off:
+Use `run-experiment` for one condition and one descriptor. Use `run-matrix` to run every selected descriptor automatically. For the final primary comparison, C1 is `conventional-otel`; the legacy `conventional` condition remains available only for reproducing older data.
 
 ```powershell
 node tools/run-matrix.mjs --measurement-mode primary --conditions baseline --repetitions 3
-node tools/run-matrix.mjs --measurement-mode primary --conditions conventional --repetitions 3
-node tools/run-matrix.mjs --measurement-mode primary --conditions proposed --repetitions 3
+node tools/run-matrix.mjs --measurement-mode primary --conditions conventional-otel --repetitions 3
+node tools/run-matrix.mjs --measurement-mode primary --conditions proposed-memory --repetitions 3
+node tools/run-matrix.mjs --measurement-mode primary --conditions proposed-durable --repetitions 3
 ```
 
 Run a separate diagnostic matrix only when explaining a finding. It produces
 observability artifacts but is intentionally excluded from `primary_results.csv`:
 
 ```powershell
-node tools/run-matrix.mjs --measurement-mode diagnostic --conditions proposed --repetitions 3
+node tools/run-matrix.mjs --measurement-mode diagnostic --conditions conventional-otel,proposed-memory,proposed-durable --repetitions 3
 ```
 
-It runs the conditions in this order: `baseline`, `conventional`, then `proposed`.
+It runs the selected conditions in the supplied order. For the final comparison use `baseline`, `conventional-otel`, `proposed-memory`, then `proposed-durable`.
 Within each condition, descriptors run from low to high RPS. Before every
 workload repetition it starts a fresh isolated Compose stack and waits for health
 checks; it always stops that stack afterward. This state reset prevents an
@@ -288,7 +289,7 @@ node tools/run-experiment.mjs --descriptor workloads/v1/o1-shallow-low.json --co
 ```
 
 Use the same workload descriptor, warm-up, duration, Docker allocation, and
-load-generator policy when comparing C0 (`baseline`), C1 (`conventional`), C2,
+load-generator policy when comparing C0 (`baseline`), C1 (`conventional-otel`), C2,
 and C3. Do not merge their historical and refactored results into one aggregate.
 
 `proposed-memory` captures one completion `ExecutionRecord` per selected
@@ -302,7 +303,7 @@ not prove reconstruction.
 Run the refactored conditions in the matrix runner with:
 
 ```powershell
-node tools/run-matrix.mjs --conditions baseline,conventional,proposed-memory,proposed-durable --measurement-mode primary
+node tools/run-matrix.mjs --conditions baseline,conventional-otel,proposed-memory,proposed-durable --measurement-mode primary
 ```
 
 See `ASYNC_TRACING_AUDIT.md` for the audited boundaries, the protected V4.1

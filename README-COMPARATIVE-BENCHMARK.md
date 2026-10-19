@@ -5,7 +5,7 @@ Panduan ini menghasilkan dataset baru yang dapat dibandingkan secara adil untuk 
 | Kode | Condition CLI | Arti |
 | --- | --- | --- |
 | C0 | `baseline` | Aplikasi tanpa tracing. |
-| C1 | `conventional` | Tracing conventional yang ada di repository. |
+| C1 | `conventional-otel` | OpenTelemetry SDK dengan `BatchSpanProcessor` dan HTTP collector. |
 | C2 | `proposed-memory` | Satu execution record per boundary, buffer RAM bounded, batch asynchronous. |
 | C3 | `proposed-durable` | Kontrak record C2 dengan WAL local dan asynchronous group commit. |
 
@@ -34,7 +34,7 @@ Jalankan tiga repetition untuk setiap workload dan setiap condition:
 
 ```powershell
 node tools/run-matrix.mjs `
-  --conditions baseline,conventional,proposed-memory,proposed-durable `
+  --conditions baseline,conventional-otel,proposed-memory,proposed-durable `
   --repetitions 3 `
   --measurement-mode primary
 ```
@@ -45,7 +45,7 @@ Untuk smoke test operasional, bukan dataset penelitian final:
 
 ```powershell
 node tools/run-matrix.mjs `
-  --conditions baseline,conventional,proposed-memory,proposed-durable `
+  --conditions baseline,conventional-otel,proposed-memory,proposed-durable `
   --descriptors o1-shallow-low `
   --repetitions 1 `
   --measurement-mode primary
@@ -89,14 +89,14 @@ Setelah primary matrix selesai, jalankan diagnostic matrix untuk menjelaskan has
 
 ```powershell
 node tools/run-matrix.mjs `
-  --conditions conventional,proposed-memory,proposed-durable `
+  --conditions conventional-otel,proposed-memory,proposed-durable `
   --repetitions 1 `
   --measurement-mode diagnostic
 ```
 
 Gunakan `observability_results.csv`, `internal-observability-summary.csv`, dan `runs/<run-id>/observability/` untuk membaca queue pressure, worker, reconstruction, serialization, serta instrumentation. Karena diagnostic mode menambahkan pengukuran internal, hasilnya tidak boleh digabung dengan `primary_results.csv`.
 
-Setiap run conventional, `proposed-memory`, dan `proposed-durable` juga membuat
+Setiap run `conventional-otel`, `proposed-memory`, dan `proposed-durable` juga membuat
 `trace-diagram.svg` dan `trace-diagram.json` pada folder run. Diagram memilih
 trace lengkap bila tersedia; jika tidak tersedia, diagram menampilkan trace
 dengan record paling banyak dan menandainya `INCOMPLETE`.
@@ -105,7 +105,7 @@ dengan record paling banyak dan menandainya `INCOMPLETE`.
 
 ```text
 C0 baseline ────────┐
-C1 conventional ────┼── primary matrix ──> primary_results.csv
+C1 conventional-otel┼── primary matrix ──> primary_results.csv
 C2 proposed-memory ─┤                         + run_validation.csv
 C3 proposed-durable ┘
 
@@ -118,3 +118,5 @@ Bandingkan C0–C3 pada request latency, business latency, achieved RPS, success
 ## 6. Reproduksibilitas
 
 Simpan folder matrix lengkap, command yang dipakai, waktu eksekusi, konfigurasi Docker Desktop, dan commit hash source bersama data penelitian. Artefak V4.1 tetap eksperimen terpisah dan tidak boleh digabungkan dengan dataset ini.
+
+Untuk mengukur perilaku saat gangguan dan recovery, gunakan matriks yang berbeda di [README-FAULT-INJECTION.md](README-FAULT-INJECTION.md). Hasil fault injection tidak boleh digabungkan dengan primary matrix sehat.

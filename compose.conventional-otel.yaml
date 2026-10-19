@@ -1,11 +1,11 @@
-# Final conventional comparator: OpenTelemetry SDK + BatchSpanProcessor.
+# Final conventional comparison: OpenTelemetry SDK with BatchSpanProcessor.
 services:
   gateway: &otel-service
     environment:
       TRACING_MODE: conventional-otel
       TRACE_COLLECTOR_URL: http://trace-collector:3000
-      OTEL_BSP_SCHEDULE_DELAY_MS: ${OTEL_BSP_SCHEDULE_DELAY_MS:-200}
-      OTEL_BSP_MAX_EXPORT_BATCH_SIZE: ${OTEL_BSP_MAX_EXPORT_BATCH_SIZE:-200}
+      OTEL_BSP_SCHEDULE_DELAY_MS: ${OTEL_BSP_SCHEDULE_DELAY_MS:-100}
+      OTEL_BSP_MAX_EXPORT_BATCH_SIZE: ${OTEL_BSP_MAX_EXPORT_BATCH_SIZE:-256}
   catalog: *otel-service
   inventory: *otel-service
   trace-collector:

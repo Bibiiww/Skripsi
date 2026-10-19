@@ -39,7 +39,7 @@ if (tracer) {
   });
 }
 if (otelTracer) {
-  app.addHook("onRequest", async (request, reply) => { request.otelTrace = otelTracer.beginServerSpan(request.headers, `${request.method} ${request.routeOptions.url}`); reply.header("x-trace-id", request.otelTrace.span.spanContext().traceId); });
+  app.addHook("onRequest", async (request, reply) => { const active = otelTracer.beginServerSpan(request.headers, `${request.method} ${request.routeOptions.url}`); request.otelTrace = active; reply.header("x-trace-id", active.span.spanContext().traceId); });
   app.addHook("onResponse", async (request, reply) => { if (request.otelTrace) otelTracer.endServerSpan(request.otelTrace, reply.statusCode); });
 }
 app.get("/health", async () => ({ status: "ok", role }));
