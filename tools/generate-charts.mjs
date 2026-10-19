@@ -26,7 +26,7 @@ if (records.some((record) => record.scheduled_requests === undefined)) {
     return {
       condition: record.condition, descriptor_id: record.descriptorId, target_rps: target, status,
       request_latency_p95_ms: http.latencyMs?.p95, success_rate_percent: successRate,
-      successful_requests: http.successfulRequests, memory_bytes_mean: record.resources?.memoryBytes?.mean,
+      successful_requests: http.successfulRequests, successful_throughput_rps: http.successfulThroughputRps, memory_bytes_mean: record.resources?.memoryBytes?.mean,
       cpu_percent_mean: record.resources?.cpuPercent?.mean, business_processing_p95_ms: http.businessProcessingMs?.p95,
       reconstruction_success_rate_percent: record.tracing?.reconstructionSuccessRatePercent
     };
@@ -42,6 +42,7 @@ const data = records.map((record) => ({
   latencyP95: record.request_latency_p95_ms,
   successRate: record.success_rate_percent,
   successfulRequests: record.successful_requests,
+  successfulThroughput: record.successful_throughput_rps,
   memoryMiB: record.memory_bytes_mean === null ? null : record.memory_bytes_mean / (1024 * 1024),
   cpuPercent: record.cpu_percent_mean,
   businessP95: record.business_processing_p95_ms,
@@ -57,7 +58,7 @@ body{font-family:system-ui,sans-serif;margin:24px;background:#fafafa;color:#1620
 <script>
 const data=${JSON.stringify(data)};
 const metrics=[
-  ['latencyP95','Request latency p95','ms'],['successRate','Success rate','%'],['successfulRequests','Successful requests','requests'],['memoryMiB','Mean memory usage','MiB'],['cpuPercent','Mean CPU usage','%'],['businessP95','Business processing p95','ms'],['reconstructionRate','Reconstruction success rate','%']
+  ['latencyP95','Request latency p95','ms'],['successRate','Success rate','%'],['successfulThroughput','Successful throughput','requests/s'],['successfulRequests','Successful requests','requests'],['memoryMiB','Mean memory usage','MiB'],['cpuPercent','Mean CPU usage','%'],['businessP95','Business processing p95','ms'],['reconstructionRate','Reconstruction success rate','%']
 ];
 const conditions=['baseline','conventional','proposed'];
 const labels=[...new Map(data.sort((a,b)=>(a.targetRps-b.targetRps)||a.descriptor.localeCompare(b.descriptor)).map(d=>[d.descriptor+' @ '+d.targetRps+' RPS',d])).keys()];

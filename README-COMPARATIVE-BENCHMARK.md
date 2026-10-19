@@ -73,6 +73,16 @@ saturated = false
 
 Run saturated tetap penting, tetapi harus dilaporkan sebagai analisis kapasitas/stress test terpisah. Jangan menghapusnya maupun memasukkannya ke rata-rata steady state.
 
+`achieved_rps` berarti seluruh response HTTP yang selesai per detik. Untuk
+throughput menurut definisi proposal, gunakan `successful_throughput_rps`, yaitu
+response HTTP 2xx per detik pengukuran aktual. Field ini adalah basis yang tepat
+untuk menghitung throughput degradation ketika request gagal.
+
+Untuk C2/C3, `reconstruction_success_rate_percent` kini memakai trace lengkap:
+tepat satu root, seluruh parent invocation ada, tidak ada siklus, root sukses,
+dan jumlah execution record sesuai kontrak workload sukses (saat ini 9 record).
+Nilai ini tidak lagi sekadar menunjukkan bahwa sebuah root trace pernah tiba.
+
 ## 4. Diagnostic matrix terpisah
 
 Setelah primary matrix selesai, jalankan diagnostic matrix untuk menjelaskan hasil—bukan sebagai angka utama:
@@ -85,6 +95,11 @@ node tools/run-matrix.mjs `
 ```
 
 Gunakan `observability_results.csv`, `internal-observability-summary.csv`, dan `runs/<run-id>/observability/` untuk membaca queue pressure, worker, reconstruction, serialization, serta instrumentation. Karena diagnostic mode menambahkan pengukuran internal, hasilnya tidak boleh digabung dengan `primary_results.csv`.
+
+Setiap run conventional, `proposed-memory`, dan `proposed-durable` juga membuat
+`trace-diagram.svg` dan `trace-diagram.json` pada folder run. Diagram memilih
+trace lengkap bila tersedia; jika tidak tersedia, diagram menampilkan trace
+dengan record paling banyak dan menandainya `INCOMPLETE`.
 
 ## 5. Skema analisis
 

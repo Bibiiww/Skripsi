@@ -5,6 +5,7 @@ import { buildQuote } from "./gateway/service.js";
 import { checkAvailability } from "./inventory/service.js";
 import { createWorkloadProfile, getWorkloadProfile, type ComputationalSignature, type StructuralSignature } from "./workload/profiles.js";
 import { ConventionalTracer, type ActiveServerTrace, type TraceSpan } from "./tracing/conventional.js";
+import { ConventionalOtelTracer, type OtelActiveTrace } from "./tracing/conventional-otel.js";
 import { currentProposedTraceId, runProposedRequest, type TraceEvent } from "./tracing/proposed.js";
 import { BoundedEventQueue } from "./tracing/queue.js";
 import { ReconstructionStore } from "./tracing/reconstruction.js";
@@ -14,7 +15,7 @@ import type { ExecutionRecord } from "./tracing/async-execution.js";
 import { internalMetrics, observeBusiness, observeRequest, observeTiming, increment, resetInternalMetrics } from "./observability/internal.js";
 
 declare module "fastify" {
-  interface FastifyRequest { conventionalTrace?: ActiveServerTrace; }
+  interface FastifyRequest { conventionalTrace?: ActiveServerTrace; otelTrace?: OtelActiveTrace; }
 }
 
 const role = process.env.SERVICE_ROLE ?? "gateway";
@@ -26,6 +27,7 @@ const tracingMode = process.env.TRACING_MODE ?? "off";
 const tracer = tracingMode === "conventional" && role !== "trace-collector"
   ? new ConventionalTracer(role, process.env.TRACE_COLLECTOR_URL ?? "http://localhost:4318")
   : undefined;
+const otelTracer = tracingMode === "conventional-otel" && role !== "trace-collector" ? new ConventionalOtelTracer(role, process.env.TRACE_COLLECTOR_URL ?? "http://localhost:4318") : undefined;
 
 if (tracer) {
   app.addHook("onRequest", async (request, reply) => {
@@ -36,7 +38,10 @@ if (tracer) {
     if (request.conventionalTrace) await tracer.endServerSpan(request.conventionalTrace, reply.statusCode);
   });
 }
-
+if (otelTracer) {
+  app.addHook("onRequest", async (request, reply) => { request.otelTrace = otelTracer.beginServerSpan(request.headers, `${request.method} ${request.routeOptions.url}`); reply.header("x-trace-id", request.otelTrace.span.spanContext().traceId); });
+  app.addHook("onResponse", async (request, reply) => { if (request.otelTrace) otelTracer.endServerSpan(request.otelTrace, reply.statusCode); });
+}
 app.get("/health", async () => ({ status: "ok", role }));
 app.get("/v1/internal-observability", async () => ({ role, ...internalMetrics() }));
 app.post("/v1/internal-observability/reset", async () => { resetInternalMetrics(); return { reset: true, role }; });
@@ -60,6 +65,8 @@ if (role === "trace-event-queue") {
   const executionStore = new ExecutionReconstructionStore();
   app.get("/v1/metrics", async () => store.summary());
   app.get("/v2/metrics", async () => executionStore.summary());
+  app.get("/v2/traces", async () => ({ traces: executionStore.list() }));
+  app.get("/v1/traces", async () => ({ traces: store.list() }));
   app.get<{ Params: { traceId: string } }>("/v2/traces/:traceId", async (request, reply) => executionStore.get(request.params.traceId) ?? reply.code(404).send({ error: "trace_not_found" }));
   app.get<{ Params: { requestId: string } }>("/v1/traces/:requestId", async (request, reply) => {
     const trace = store.get(request.params.requestId);
@@ -88,10 +95,11 @@ if (role === "trace-event-queue") {
   setInterval(() => void poll(), workerIntervalMs);
 } else if (role === "trace-collector") {
   const spans: TraceSpan[] = [];
+  const acceptSpans = async (items: TraceSpan[], reply: { code: (status: number) => { send: (value: unknown) => unknown } }) => { const started = performance.now(); spans.push(...items); increment("COLLECTOR", "spans_received", items.length); observeTiming("COLLECTOR", "processing_duration_ms", performance.now() - started); return reply.code(202).send({ accepted: true }); };
   app.post<{ Body: TraceSpan }>("/v1/spans", async (request, reply) => {
-    const started = performance.now(); spans.push(request.body); increment("COLLECTOR", "spans_received"); observeTiming("COLLECTOR", "processing_duration_ms", performance.now() - started);
-    return reply.code(202).send({ accepted: true });
+    return acceptSpans([request.body], reply);
   });
+  app.post<{ Body: { spans?: TraceSpan[] } }>("/v1/spans/batch", async (request, reply) => acceptSpans(request.body.spans ?? [], reply));
   app.get<{ Params: { traceId: string } }>("/v1/traces/:traceId", async (request) => {
     return { traceId: request.params.traceId, spans: spans.filter((span) => span.traceId === request.params.traceId) };
   });
@@ -99,10 +107,14 @@ if (role === "trace-event-queue") {
   app.get("/v1/metrics", async () => {
     const started = performance.now(); const byTrace = new Map<string, TraceSpan[]>();
     for (const span of spans) byTrace.set(span.traceId, [...(byTrace.get(span.traceId) ?? []), span]);
-    const completeTraces = [...byTrace.values()].filter((trace) => trace.some((span) => span.kind === "server")).length;
+    const expected = Number(process.env.TRACE_EXPECTED_CONVENTIONAL_SPANS ?? 5);
+    const completeTraces = [...byTrace.values()].filter((trace) => {
+      const ids = new Set(trace.map((span) => span.spanId)); const roots = trace.filter((span) => span.parentSpanId === null);
+      return trace.length === expected && roots.length === 1 && trace.every((span) => span.parentSpanId === null || ids.has(span.parentSpanId));
+    }).length;
     const reconstructionDurationMs = performance.now() - started;
     observeTiming("RECONSTRUCTION", "duration_ms", reconstructionDurationMs); increment("RECONSTRUCTION", "attempts", byTrace.size); increment("RECONSTRUCTION", "success", completeTraces); increment("RECONSTRUCTION", "failed", byTrace.size - completeTraces);
-    return { spansCreated: spans.length, spansReceived: spans.length, spansProcessed: spans.length, observedTraces: byTrace.size, completeTraces, reconstructionDurationMs };
+    return { spansCreated: spans.length, spansReceived: spans.length, spansProcessed: spans.length, observedTraces: byTrace.size, completeTraces, incompleteTraces: byTrace.size - completeTraces, expectedSpansPerSuccessfulTrace: expected, reconstructionDurationMs };
   });
 } else if (role === "catalog") {
   app.get<{ Params: { productId: string } }>("/products/:productId", async (request, reply) => observeRequest("catalog.handler.getProduct", () => runProposedRequest(request.headers, "catalog.handler.getProduct", () => observeBusiness("handler", async () => {
@@ -135,7 +147,11 @@ if (role === "trace-event-queue") {
       if (request.query.profile && !profile) return reply.code(400).send({ error: "unknown_workload_profile" });
       if (hasExplicitWorkload && !profile) return reply.code(400).send({ error: "invalid_workload_parameters" });
       try {
-        const trace = tracer && request.conventionalTrace ? { tracer, active: request.conventionalTrace } : undefined;
+        const trace = tracer && request.conventionalTrace
+          ? { tracer, active: request.conventionalTrace }
+          : otelTracer && request.otelTrace
+            ? { tracer: otelTracer, active: request.otelTrace }
+            : undefined;
         // Business Processing Time starts when the gateway invokes business logic
         // and ends when the quote is ready. It excludes HTTP parsing/validation
         // and client-to-gateway transfer, while retaining tracing overhead that

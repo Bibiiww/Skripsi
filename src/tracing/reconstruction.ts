@@ -53,4 +53,11 @@ export class ReconstructionStore {
       incompleteSpans: traces.reduce((total, trace) => total + trace.incompleteSpans, 0)
     };
   }
+
+  list() {
+    return [...this.eventsByRequest.keys()].map((requestId) => {
+      const trace = this.get(requestId)!;
+      return { requestId, complete: trace.complete, observedRecords: trace.nodes.length, expectedRecords: null };
+    });
+  }
 }

@@ -112,7 +112,7 @@ const traceDrainTimeoutSeconds = Number(option("--trace-drain-timeout-seconds", 
 const saturationThresholdPercent = Number(option("--saturation-threshold-percent", "95"));
 const internalObservability = option("--internal-observability", process.env.INTERNAL_OBSERVABILITY ?? "false") === "true";
 if (!descriptorPath || !condition) throw new Error("Usage: node tools/run-experiment.mjs --descriptor FILE --condition baseline|conventional|proposed|proposed-memory|proposed-durable [--base-url URL]");
-if (!["baseline", "conventional", "proposed", "proposed-memory", "proposed-durable"].includes(condition)) throw new Error("condition must be baseline, conventional, proposed, proposed-memory, or proposed-durable");
+if (!["baseline", "conventional", "conventional-otel", "proposed", "proposed-memory", "proposed-durable"].includes(condition)) throw new Error("unsupported condition");
 if (!Number.isFinite(saturationThresholdPercent) || saturationThresholdPercent <= 0 || saturationThresholdPercent > 100) throw new Error("--saturation-threshold-percent must be greater than 0 and at most 100.");
 const recordMode = condition === "proposed-memory" || condition === "proposed-durable";
 const selectedQueueMetricsUrl = recordMode ? queueMetricsUrl.replace(/\/v1\/metrics$/, "/v2/metrics") : queueMetricsUrl;
@@ -131,6 +131,7 @@ await copyFile(descriptorAbsolutePath, join(runDir, "workload.json"));
 
 const composeFiles = condition === "conventional"
   ? ["compose.yaml", "compose.conventional.yaml"]
+  : condition === "conventional-otel" ? ["compose.yaml", "compose.conventional-otel.yaml"]
   : condition === "proposed" ? ["compose.yaml", "compose.proposed.yaml"]
   : condition === "proposed-memory" ? ["compose.yaml", "compose.proposed-memory.yaml"]
   : condition === "proposed-durable" ? ["compose.yaml", "compose.proposed-durable.yaml"]
@@ -183,7 +184,7 @@ try {
   }
   const internalUrls = condition === "proposed" || recordMode
     ? { gateway: `${baseUrl}/v1/internal-observability`, queue: "http://127.0.0.1:16686/v1/internal-observability", worker: "http://127.0.0.1:16687/v1/internal-observability" }
-    : condition === "conventional"
+    : condition === "conventional" || condition === "conventional-otel"
       ? { gateway: `${baseUrl}/v1/internal-observability`, collector: "http://127.0.0.1:16686/v1/internal-observability" }
       : { gateway: `${baseUrl}/v1/internal-observability` };
   const gatewayDiagnosticState = await json(internalUrls.gateway);
@@ -194,15 +195,16 @@ try {
   const child = spawn(process.execPath, ["tools/load-generator.mjs", "--descriptor", descriptorAbsolutePath, "--base-url", baseUrl, "--skip-warmup", "--output", join(runDir, "http-summary.json")], { stdio: "inherit" });
   await waitForChild(child);
   const http = JSON.parse(await readFile(join(runDir, "http-summary.json"), "utf8"));
-  const primaryPerformance = { schemaVersion: "1.0.0", measurementBoundary: manifest.measurementBoundary.version, condition, workload_id: descriptor.id, run_id: runId, achieved_rps: http.achievedRps, successful_requests: http.successfulRequests, request_latency_ms: http.latencyMs, business_latency_ms: http.businessProcessingMs };
+  const primaryPerformance = { schemaVersion: "1.1.0", measurementBoundary: manifest.measurementBoundary.version, condition, workload_id: descriptor.id, run_id: runId, achieved_rps: http.achievedRps, successful_throughput_rps: http.successfulThroughputRps, successful_requests: http.successfulRequests, request_latency_ms: http.latencyMs, business_latency_ms: http.businessProcessingMs };
   await writeFile(join(runDir, "latency.json"), `${JSON.stringify(primaryPerformance, null, 2)}\n`);
   await writeFile(join(runDir, "primary", "performance.json"), `${JSON.stringify(primaryPerformance, null, 2)}\n`);
-  await writeFile(join(runDir, "primary", "latency.csv"), `condition,workload_id,run_id,achieved_rps,successful_requests,request_latency_mean_ms,request_latency_p50_ms,request_latency_p95_ms,request_latency_p99_ms,business_latency_mean_ms,business_latency_p50_ms,business_latency_p95_ms,business_latency_p99_ms\n${condition},${descriptor.id},${runId},${http.achievedRps},${http.successfulRequests},${http.latencyMs.mean},${http.latencyMs.p50},${http.latencyMs.p95},${http.latencyMs.p99},${http.businessProcessingMs.mean},${http.businessProcessingMs.p50},${http.businessProcessingMs.p95},${http.businessProcessingMs.p99}\n`);
+  await writeFile(join(runDir, "primary", "latency.csv"), `condition,workload_id,run_id,achieved_rps,successful_throughput_rps,successful_requests,request_latency_mean_ms,request_latency_p50_ms,request_latency_p95_ms,request_latency_p99_ms,business_latency_mean_ms,business_latency_p50_ms,business_latency_p95_ms,business_latency_p99_ms\n${condition},${descriptor.id},${runId},${http.achievedRps},${http.successfulThroughputRps},${http.successfulRequests},${http.latencyMs.mean},${http.latencyMs.p50},${http.latencyMs.p95},${http.latencyMs.p99},${http.businessProcessingMs.mean},${http.businessProcessingMs.p50},${http.businessProcessingMs.p95},${http.businessProcessingMs.p99}\n`);
   const successRatePercent = http.scheduledRequests ? (http.successfulRequests / http.scheduledRequests) * 100 : 0;
   const generatorDropRatePercent = http.scheduledRequests ? (http.generatorDrops / http.scheduledRequests) * 100 : 0;
   const achievedTargetRatePercent = descriptor.request.rateRps ? (http.achievedRps / descriptor.request.rateRps) * 100 : 0;
   manifest.measurementValidation = {
     successfulRequests: http.successfulRequests,
+    successfulThroughputRps: http.successfulThroughputRps,
     completedRequests: http.completedRequests,
     transportErrors: http.transportErrors,
     successRatePercent,
@@ -233,6 +235,18 @@ try {
     if (queue.dropped > 0) saturationSignals.push("queue_drops_observed");
     if (!drain.drained) saturationSignals.push("async_pipeline_not_drained");
   }
+  if (condition === "conventional" || condition === "conventional-otel") {
+    // Server spans are exported from Fastify's onResponse hook; let the final
+    // hook/export complete before taking the collector snapshot and diagram.
+    await sleep(1000);
+    const collector = await json("http://127.0.0.1:16686/v1/metrics");
+    const metrics = { schemaVersion: "1.2.0", capturedAt: new Date().toISOString(), measurementOnly: true, expectedRequests: http.successfulRequests, tracingUnit: "span", events: { produced: collector.spansCreated, enqueued: collector.spansReceived, dropped: null, reconstructed: collector.spansProcessed }, reconstruction: collector, queueDropRatePercent: null, reconstructionSuccessRatePercent: http.successfulRequests ? (collector.completeTraces / http.successfulRequests) * 100 : null };
+    await writeFile(join(runDir, "tracing-metrics.json"), `${JSON.stringify(metrics, null, 2)}\n`);
+  }
+  if (condition === "conventional" || condition === "conventional-otel" || condition === "proposed" || recordMode) {
+    const endpoint = condition === "conventional" || condition === "conventional-otel" ? "http://127.0.0.1:16686" : "http://127.0.0.1:16687";
+    run(process.execPath, ["tools/generate-trace-diagram.mjs", "--condition", condition, "--endpoint", endpoint, "--output", join(runDir, "trace-diagram.svg")]);
+  }
   if (internalObservability) {
     const exposedServices = await internalSnapshot(internalUrls);
     const services = { ...containerInternalSnapshots(ids), ...exposedServices };
@@ -241,7 +255,7 @@ try {
     const worker = services.worker;
     const collector = services.collector;
     const queueMetrics = condition === "proposed" || recordMode ? await json(selectedQueueMetricsUrl) : null;
-    const collectorMetrics = condition === "conventional" ? await json("http://127.0.0.1:16686/v1/metrics") : null;
+    const collectorMetrics = condition === "conventional" || condition === "conventional-otel" ? await json("http://127.0.0.1:16686/v1/metrics") : null;
     const applicationServices = Object.fromEntries(Object.entries(services).filter(([name]) => ["gateway", "catalog", "inventory"].includes(name)));
     const eventsProduced = sumCounter(applicationServices, "EVENT_CAPTURE.events_produced");
     const submitted = sumCounter(applicationServices, "EVENT_SUBMISSION.initiated");
@@ -259,8 +273,8 @@ try {
       event_submission: { attempts: sumCounter(applicationServices, "EVENT_SUBMISSION.attempts"), initiated: submitted, errors: sumCounter(applicationServices, "EVENT_SUBMISSION.errors") + sumCounter(applicationServices, "EVENT_SUBMISSION.initiation_errors"), init_duration_ms: timing(gateway, "EVENT_SUBMISSION.init_duration_ms"), bytes: sumCounter(applicationServices, "EVENT_SUBMISSION.bytes") },
       queue: queueMetrics ? { capacity: queueMetrics.capacity, depth: queueMetrics.queued, depth_mean: queueMetrics.queueDepthMean, depth_max: queueMetrics.queueDepthMax, utilization: queueMetrics.queueUtilization, utilization_max: queueMetrics.queueUtilizationMax, admission_duration_ms: timing(queueService, "QUEUE.enqueue_duration_ms"), wait_ms: timing(queueService, "QUEUE.wait_ms"), enqueue_attempts: counter(queueService, "QUEUE.enqueue_attempts"), enqueue_success: enqueued, enqueue_dropped: dropped, enqueue_drop_rate: enqueued + dropped ? dropped / (enqueued + dropped) : null } : null,
       worker: worker ? { batches: counter(worker, "WORKER.batches"), events_dequeued: dequeued, events_processed: counter(worker, "WORKER.events_processed"), batch_duration_ms: timing(worker, "WORKER.batch_duration_ms"), processing_duration_ms: timing(worker, "WORKER.processing_duration_ms"), busy_time_ms: timing(worker, "WORKER.processing_duration_ms").total, idle_time_ms: timing(worker, "WORKER.idle_time_ms").total, throughput_events_per_second: timing(worker, "WORKER.processing_duration_ms").total ? (counter(worker, "WORKER.events_processed") * 1000) / timing(worker, "WORKER.processing_duration_ms").total : null } : null,
-      reconstruction: condition === "conventional" ? { attempts: collectorMetrics?.observedTraces ?? null, success: collectorMetrics?.completeTraces ?? null, failed: collectorMetrics ? collectorMetrics.observedTraces - collectorMetrics.completeTraces : null, success_rate: collectorMetrics?.observedTraces ? collectorMetrics.completeTraces / collectorMetrics.observedTraces : null, duration_ms: collectorMetrics?.reconstructionDurationMs ?? null } : { attempts: counter(worker, "RECONSTRUCTION.attempts"), success: reconstructed, failed: counter(worker, "RECONSTRUCTION.failed"), success_rate: counter(worker, "RECONSTRUCTION.attempts") ? reconstructed / counter(worker, "RECONSTRUCTION.attempts") : null, duration_ms: timing(worker, "RECONSTRUCTION.duration_ms") },
-      event_flow: condition === "conventional" ? { spans_created: sumCounter(applicationServices, "CONVENTIONAL.spans_created"), spans_exported: sumCounter(applicationServices, "CONVENTIONAL.export_success"), spans_received: collectorMetrics?.spansReceived ?? null, spans_processed: collectorMetrics?.spansProcessed ?? null, traces_reconstructed: collectorMetrics?.completeTraces ?? null } : { produced: eventsProduced, submitted, enqueue_success: enqueued, enqueue_dropped: dropped, dequeued, reconstructed, submission_loss_rate: eventsProduced ? 1 - submitted / eventsProduced : null, queue_drop_rate: enqueued + dropped ? dropped / (enqueued + dropped) : null, processing_loss_rate: enqueued ? 1 - dequeued / enqueued : null, overall_trace_event_retention: eventsProduced ? reconstructed / eventsProduced : null },
+      reconstruction: condition === "conventional" || condition === "conventional-otel" ? { attempts: collectorMetrics?.observedTraces ?? null, success: collectorMetrics?.completeTraces ?? null, failed: collectorMetrics ? collectorMetrics.observedTraces - collectorMetrics.completeTraces : null, success_rate: collectorMetrics?.observedTraces ? collectorMetrics.completeTraces / collectorMetrics.observedTraces : null, duration_ms: collectorMetrics?.reconstructionDurationMs ?? null } : { attempts: counter(worker, "RECONSTRUCTION.attempts"), success: reconstructed, failed: counter(worker, "RECONSTRUCTION.failed"), success_rate: counter(worker, "RECONSTRUCTION.attempts") ? reconstructed / counter(worker, "RECONSTRUCTION.attempts") : null, duration_ms: timing(worker, "RECONSTRUCTION.duration_ms") },
+      event_flow: condition === "conventional" || condition === "conventional-otel" ? { spans_created: collectorMetrics?.spansCreated ?? null, spans_exported: collectorMetrics?.spansReceived ?? null, spans_received: collectorMetrics?.spansReceived ?? null, spans_processed: collectorMetrics?.spansProcessed ?? null, traces_reconstructed: collectorMetrics?.completeTraces ?? null } : { produced: eventsProduced, submitted, enqueue_success: enqueued, enqueue_dropped: dropped, dequeued, reconstructed, submission_loss_rate: eventsProduced ? 1 - submitted / eventsProduced : null, queue_drop_rate: enqueued + dropped ? dropped / (enqueued + dropped) : null, processing_loss_rate: enqueued ? 1 - dequeued / enqueued : null, overall_trace_event_retention: eventsProduced ? reconstructed / eventsProduced : null },
       system: { container_metrics_file: "container-metrics.json", services },
       correlation: { target_rps: descriptor.request.rateRps, achieved_rps: http.achievedRps, computational_signature: descriptor.computational?.signature ?? null, structural_signature: descriptor.structural?.signature ?? null, input_size: descriptor.inputSize ?? descriptor.computational?.inputSize ?? null, events_per_request: http.successfulRequests ? eventsProduced / http.successfulRequests : null, queue_wait_p95: timing(queueService, "QUEUE.wait_ms").p95, request_p95: http.latencyMs?.p95, request_p99: http.latencyMs?.p99, business_p95: http.businessProcessingMs?.p95 }
     };

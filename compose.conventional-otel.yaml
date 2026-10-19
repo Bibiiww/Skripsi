@@ -1,0 +1,21 @@
+# Final conventional comparator: OpenTelemetry SDK + BatchSpanProcessor.
+services:
+  gateway: &otel-service
+    environment:
+      TRACING_MODE: conventional-otel
+      TRACE_COLLECTOR_URL: http://trace-collector:3000
+      OTEL_BSP_SCHEDULE_DELAY_MS: ${OTEL_BSP_SCHEDULE_DELAY_MS:-200}
+      OTEL_BSP_MAX_EXPORT_BATCH_SIZE: ${OTEL_BSP_MAX_EXPORT_BATCH_SIZE:-200}
+  catalog: *otel-service
+  inventory: *otel-service
+  trace-collector:
+    build: .
+    environment:
+      SERVICE_ROLE: trace-collector
+      PORT: 3000
+    ports: ["16686:3000"]
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://localhost:3000/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 5s
+      timeout: 3s
+      retries: 10

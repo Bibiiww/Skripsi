@@ -133,6 +133,7 @@ const summary = {
   transportErrorDetails: transportErrorSummary.transportErrorDetails,
   statuses,
   achievedRps: latenciesMs.length / elapsedSeconds,
+  successfulThroughputRps: Object.entries(statuses).filter(([status]) => Number(status) >= 200 && Number(status) < 300).reduce((total, [, count]) => total + count, 0) / elapsedSeconds,
   latencyMs: metricSummary(latenciesMs),
   businessProcessingMs: { ...metricSummary(businessProcessingMs), missingSamples: missingBusinessProcessingMetrics }
 };

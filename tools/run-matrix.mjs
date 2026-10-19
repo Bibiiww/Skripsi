@@ -5,10 +5,11 @@ import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { basename, join, resolve } from "node:path";
 
-const conditionsAllowed = ["baseline", "conventional", "proposed", "proposed-memory", "proposed-durable"];
+const conditionsAllowed = ["baseline", "conventional", "conventional-otel", "proposed", "proposed-memory", "proposed-durable"];
 const composeFiles = {
   baseline: ["compose.yaml"],
   conventional: ["compose.yaml", "compose.conventional.yaml"],
+  "conventional-otel": ["compose.yaml", "compose.conventional-otel.yaml"],
   proposed: ["compose.yaml", "compose.proposed.yaml"],
   "proposed-memory": ["compose.yaml", "compose.proposed-memory.yaml"],
   "proposed-durable": ["compose.yaml", "compose.proposed-durable.yaml"]
@@ -173,6 +174,7 @@ function flatRecord(record) {
     started_at: record.startedAt,
     finished_at: record.finishedAt,
     achieved_rps: toNumber(http.achievedRps),
+    successful_throughput_rps: toNumber(http.successfulThroughputRps),
     target_rps: toNumber(record.targetRps),
     achieved_target_rate_percent: toNumber(record.measurementValidation?.achievedTargetRatePercent),
     successful_requests: http.successfulRequests ?? null,
@@ -217,7 +219,7 @@ function primaryRecord(record) {
   return {
     run_id: record.runId, condition: record.condition, workload_id: record.descriptorId, descriptor_sha256: record.descriptorSha256,
     measurement_boundary: record.measurementBoundary?.version ?? "legacy-measurement-boundary-uncertain",
-    achieved_rps: toNumber(http.achievedRps), successful_requests: http.successfulRequests ?? null,
+    achieved_rps: toNumber(http.achievedRps), successful_throughput_rps: toNumber(http.successfulThroughputRps), successful_requests: http.successfulRequests ?? null,
     request_latency_mean_ms: toNumber(http.latencyMs?.mean), request_latency_p50_ms: toNumber(http.latencyMs?.p50), request_latency_p95_ms: toNumber(http.latencyMs?.p95), request_latency_p99_ms: toNumber(http.latencyMs?.p99),
     business_latency_mean_ms: toNumber(http.businessProcessingMs?.mean), business_latency_p50_ms: toNumber(http.businessProcessingMs?.p50), business_latency_p95_ms: toNumber(http.businessProcessingMs?.p95), business_latency_p99_ms: toNumber(http.businessProcessingMs?.p99),
     cpu_mean_percent: resources.cpuPercent.mean ?? null, cpu_max_percent: resources.cpuPercent.max ?? null,
@@ -330,11 +332,12 @@ for (const [key, rows] of Object.entries(flattened.filter((record) => record.sta
     success_rate_percent_mean: average(successRates),
     success_rate_percent_min: successRates.length ? Math.min(...successRates) : null,
     achieved_rps_mean: average(rows.map((row) => row.achieved_rps)),
+    successful_throughput_rps_mean: average(rows.map((row) => row.successful_throughput_rps)),
     generator_drop_rate_percent_mean: average(rows.map((row) => row.generator_drop_rate_percent)),
     request_latency_p95_ms_mean: average(rows.map((row) => row.request_latency_p95_ms))
   });
 }
-const summaryColumns = ["condition", "descriptor_id", "target_rps", "runs", "completed_runs", "saturated_runs", "success_rate_percent_mean", "success_rate_percent_min", "achieved_rps_mean", "generator_drop_rate_percent_mean", "request_latency_p95_ms_mean"];
+const summaryColumns = ["condition", "descriptor_id", "target_rps", "runs", "completed_runs", "saturated_runs", "success_rate_percent_mean", "success_rate_percent_min", "achieved_rps_mean", "successful_throughput_rps_mean", "generator_drop_rate_percent_mean", "request_latency_p95_ms_mean"];
 const summaryCsv = `${summaryColumns.join(",")}\n${conditionSummary.map((record) => summaryColumns.map((column) => csv(record[column])).join(",")).join("\n")}\n`;
 const internalRows = records.filter((record) => record.internal?.diagnosticMode && (record.status === "completed" || record.status === "saturated"));
 const internalSummary = [];

@@ -1,8 +1,9 @@
 import type { Availability, Product } from "../domain/types.js";
 import type { ActiveServerTrace, ConventionalTracer } from "../tracing/conventional.js";
+import type { OtelActiveTrace, ConventionalOtelTracer } from "../tracing/conventional-otel.js";
 import { proposedTraceHeaders } from "../tracing/proposed.js";
 
-type ConventionalRequestTrace = { tracer: ConventionalTracer; active: ActiveServerTrace };
+export type ConventionalRequestTrace = { tracer: ConventionalTracer; active: ActiveServerTrace } | { tracer: ConventionalOtelTracer; active: OtelActiveTrace };
 
 async function getJson<T>(url: string, operation: string, trace?: ConventionalRequestTrace): Promise<T> {
   const response = trace
