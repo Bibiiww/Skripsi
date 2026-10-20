@@ -80,8 +80,15 @@ untuk menghitung throughput degradation ketika request gagal.
 
 Untuk C2/C3, `reconstruction_success_rate_percent` kini memakai trace lengkap:
 tepat satu root, seluruh parent invocation ada, tidak ada siklus, root sukses,
-dan jumlah execution record sesuai kontrak workload sukses (saat ini 9 record).
+dan jumlah execution record sesuai kontrak boundary workload yang dipropagasikan
+bersama trace context. Kontrak ini workload-specific: `o1-shallow-low` menghasilkan
+11 record, sedangkan bentuk moderate dan complex memiliki jumlah boundary lebih besar.
 Nilai ini tidak lagi sekadar menunjukkan bahwa sebuah root trace pernah tiba.
+
+Hasil yang dibuat sebelum kontrak record ini tersedia adalah
+`legacy / measurement-boundary-uncertain` untuk reconstruction success rate.
+Jangan menghitung ulang nilainya dari jumlah record yang tiba; ulangi run agar
+worker dapat memverifikasi kelengkapan terhadap kontrak yang benar.
 
 ## 4. Diagnostic matrix terpisah
 

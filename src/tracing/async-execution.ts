@@ -18,6 +18,12 @@ export type ExecutionRecord = {
   endedAt: string;
   durationMs: number;
   outcome: "ok" | "error";
+  /**
+   * Contract for one request's selected function boundaries. It is propagated
+   * with the trace context so the worker can distinguish a complete trace from
+   * a structurally valid but incomplete subset.
+   */
+  expectedRecordCount?: number;
   attributes?: Record<string, string | number | boolean>;
   events?: Array<{
     name: string;
@@ -30,6 +36,7 @@ type Context = {
   currentInvocationId: string | null;
   attributes: Record<string, string | number | boolean>;
   events: NonNullable<ExecutionRecord["events"]>;
+  expectedRecordCount?: number;
 };
 type WalLine =
   | { type: "record"; record: ExecutionRecord }
@@ -356,12 +363,23 @@ export function executionTraceHeaders(): Record<string, string> | undefined {
     ? {
         "x-trace-id": context.traceId,
         "x-parent-span-id": context.currentInvocationId,
+        ...(context.expectedRecordCount === undefined
+          ? {}
+          : { "x-trace-expected-records": String(context.expectedRecordCount) }),
       }
     : undefined;
 }
 
 export function currentExecutionTraceId(): string | undefined {
   return enabled ? storage.getStore()?.traceId : undefined;
+}
+
+/** Records the workload-specific boundary contract without changing execution. */
+export function setExpectedExecutionRecordCount(count: number): void {
+  const context = storage.getStore();
+  if (enabled && context && Number.isInteger(count) && count > 0) {
+    context.expectedRecordCount = count;
+  }
 }
 
 export async function withExecutionRecord<T>(
@@ -381,6 +399,7 @@ export async function withExecutionRecord<T>(
     currentInvocationId: invocationId,
     attributes: {},
     events: [],
+    expectedRecordCount: parent.expectedRecordCount,
   };
   let outcome: ExecutionRecord["outcome"] = "ok";
 
@@ -402,6 +421,9 @@ export async function withExecutionRecord<T>(
       endedAt: new Date().toISOString(),
       durationMs: performance.now() - started,
       outcome,
+      ...(context.expectedRecordCount === undefined
+        ? {}
+        : { expectedRecordCount: context.expectedRecordCount }),
       ...(Object.keys(context.attributes).length
         ? { attributes: context.attributes }
         : {}),
@@ -446,6 +468,11 @@ export async function runExecutionRequest<T>(
       currentInvocationId: header(headers["x-parent-span-id"]) ?? null,
       attributes: {},
       events: [],
+      expectedRecordCount: (() => {
+        const raw = header(headers["x-trace-expected-records"]);
+        const parsed = raw === undefined ? NaN : Number(raw);
+        return Number.isInteger(parsed) && parsed > 0 ? parsed : undefined;
+      })(),
     },
     () => withExecutionRecord(operation, "handler", execute),
   );

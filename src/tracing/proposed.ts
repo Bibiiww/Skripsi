@@ -2,7 +2,7 @@ import { AsyncLocalStorage } from "node:async_hooks";
 import { randomUUID } from "node:crypto";
 import { performance } from "node:perf_hooks";
 import { addRequestValue, increment, internalObservabilityEnabled, observeTiming } from "../observability/internal.js";
-import { addTraceAttribute as addExecutionTraceAttribute, addTraceEvent as addExecutionTraceEvent, currentExecutionTraceId, executionTraceHeaders, isAsyncExecutionTracing, runExecutionRequest, withExecutionRecord } from "./async-execution.js";
+import { addTraceAttribute as addExecutionTraceAttribute, addTraceEvent as addExecutionTraceEvent, currentExecutionTraceId, executionTraceHeaders, isAsyncExecutionTracing, runExecutionRequest, setExpectedExecutionRecordCount, withExecutionRecord } from "./async-execution.js";
 
 export type ProposedTraceContext = { requestId: string; currentSpanId: string | null };
 export type TraceEvent = {
@@ -59,6 +59,8 @@ export function currentProposedTraceId(): string | undefined {
   if (isAsyncExecutionTracing()) return currentExecutionTraceId();
   return enabled ? storage.getStore()?.requestId : undefined;
 }
+
+export { setExpectedExecutionRecordCount };
 
 export async function withProposedSpan<T>(
   functionName: string,

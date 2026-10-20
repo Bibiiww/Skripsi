@@ -20,8 +20,11 @@ export class ExecutionReconstructionStore {
       while (current?.parentInvocationId) { if (visited.has(current.invocationId)) { cycle = true; break; } visited.add(current.invocationId); current = byId.get(current.parentInvocationId); }
       if (cycle) break;
     }
-    const complete = records.length === this.expectedRecords && roots.length === 1 && missingParents === 0 && !cycle && roots[0]?.outcome === "ok";
-    return { complete, roots: roots.length, missingParents, cycle, expectedRecords: this.expectedRecords, observedRecords: records.length };
+    const declaredCounts = [...new Set(records.map((record) => record.expectedRecordCount).filter((count): count is number => typeof count === "number" && Number.isInteger(count) && count > 0))];
+    const expectedRecords = declaredCounts.length === 1 ? declaredCounts[0] : this.expectedRecords;
+    const expectationConsistent = declaredCounts.length <= 1 && records.every((record) => record.expectedRecordCount === undefined || record.expectedRecordCount === expectedRecords);
+    const complete = records.length === expectedRecords && roots.length === 1 && missingParents === 0 && !cycle && expectationConsistent && roots[0]?.outcome === "ok";
+    return { complete, roots: roots.length, missingParents, cycle, expectedRecords, observedRecords: records.length, expectationConsistent, expectationSource: declaredCounts.length === 1 ? "propagated-request-contract" : "legacy-default" };
   }
   summary() { const traces = [...this.recordsByTrace.entries()].map(([traceId, records]) => ({ traceId, records: [...records.values()], assessment: this.assessment([...records.values()]) })); const complete = traces.filter((trace) => trace.assessment.complete).length; return { observedTraces: traces.length, completeTraces: complete, incompleteTraces: traces.length - complete, reconstructedSpans: traces.reduce((total, trace) => total + trace.records.length, 0), expectedRecordsPerSuccessfulTrace: this.expectedRecords }; }
   get(traceId: string) { const records = this.recordsByTrace.get(traceId); return records ? { traceId, records: [...records.values()], assessment: this.assessment([...records.values()]) } : undefined; }

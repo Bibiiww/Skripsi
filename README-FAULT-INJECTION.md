@@ -73,6 +73,11 @@ Kolom penting:
 - `reconstruction_success_rate_percent`: trace lengkap / trace yang teramati oleh collector atau worker.
 - `status=technical-failure`: Docker, health check, generator, atau pengumpulan artefak gagal. Baris ini bukan pengamatan performa.
 
+Jalankan fault matrix kembali setelah memperbarui source. Runner lama membaca
+nama field generator yang sudah tidak dipakai, sehingga menulis
+`scheduled_requests` dan `successful_requests` sebagai kosong. Dataset dengan
+dua kolom tersebut kosong tidak valid untuk mengukur availability atau retention.
+
 Jangan menyamakan restart collector pada OTel dengan restart worker proposed sebagai failure yang identik secara arsitektur. Matriks ini menyediakan gangguan yang relevan pada peran pipeline yang bersesuaian; `target_service` disimpan agar pembaca mengetahui intervensi aktualnya.
 
 ## Memisahkan analisis

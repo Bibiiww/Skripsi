@@ -54,7 +54,7 @@ function faultTarget(condition, scenario) {
   if (condition === "conventional-otel") return "trace-collector";
   return scenario === "central-outage" ? "trace-event-queue" : "trace-reconstruction-worker";
 }
-function expectedSpans(summary) { return Number(summary?.successful ?? 0) * 5; }
+function expectedSpans(summary) { return Number(summary?.successfulRequests ?? 0) * 5; }
 
 async function collect(condition, loadSummary) {
   if (condition === "conventional-otel") {
@@ -144,7 +144,7 @@ for (const condition of conditions) for (const scenario of scenarios) for (let r
   let summary = null; try { summary = JSON.parse(await readFile(loadOutput, "utf8")); } catch { /* technical failure is kept in the output row */ }
   let tracing = {}; try { tracing = await collect(condition, summary); } catch (error) { faultError ??= `metric collection: ${error instanceof Error ? error.message : String(error)}`; }
   try { await execute(process.execPath, ["tools/generate-trace-diagram.mjs", "--condition", condition, "--endpoint", condition === "conventional-otel" ? "http://127.0.0.1:16686" : "http://127.0.0.1:16687", "--output", join(runDir, "trace-diagram.svg")], { quiet: true }); } catch { /* fault result stays useful without a diagram */ }
-  const scheduled = summary?.scheduled ?? null; const successful = summary?.successful ?? null;
+  const scheduled = summary?.scheduledRequests ?? null; const successful = summary?.successfulRequests ?? null;
   rows.push({ run_id: runId, condition, scenario, target_service: target, repetition, status: faultError || loadError ? "technical-failure" : "completed", started_at: startedAt, finished_at: new Date().toISOString(), scheduled_requests: scheduled, successful_requests: successful, success_rate_percent: scheduled ? 100 * successful / scheduled : null, successful_throughput_rps: summary?.successfulThroughputRps ?? null, transport_errors: summary?.transportErrors ?? null, recovery_time_ms: recoveryTimeMs, backlog_drain_time_ms: drainTimeMs, ...tracing, error: [faultError, loadError].filter(Boolean).join(" | ") || null, run_directory: runDir });
   try { await execute("docker", [...compose, "down", "--remove-orphans"], { quiet: true }); } catch { /* preserve the collected result, but leave cleanup visible to Docker */ }
 }

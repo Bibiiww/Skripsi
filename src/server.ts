@@ -6,7 +6,7 @@ import { checkAvailability } from "./inventory/service.js";
 import { createWorkloadProfile, getWorkloadProfile, type ComputationalSignature, type StructuralSignature } from "./workload/profiles.js";
 import { ConventionalTracer, type ActiveServerTrace, type TraceSpan } from "./tracing/conventional.js";
 import { ConventionalOtelTracer, type OtelActiveTrace } from "./tracing/conventional-otel.js";
-import { currentProposedTraceId, runProposedRequest, type TraceEvent } from "./tracing/proposed.js";
+import { currentProposedTraceId, runProposedRequest, setExpectedExecutionRecordCount, type TraceEvent } from "./tracing/proposed.js";
 import { BoundedEventQueue } from "./tracing/queue.js";
 import { ReconstructionStore } from "./tracing/reconstruction.js";
 import { BoundedExecutionQueue } from "./tracing/execution-queue.js";
@@ -24,6 +24,19 @@ const catalogUrl = process.env.CATALOG_URL ?? "http://localhost:3001";
 const inventoryUrl = process.env.INVENTORY_URL ?? "http://localhost:3002";
 const app = Fastify({ logger: true });
 const tracingMode = process.env.TRACING_MODE ?? "off";
+
+function expectedExecutionRecords(profile: { structural: { boundaryDepth: number; fanOut: number } } | undefined): number {
+  // Handler/service/repository boundaries outside the controlled workload = 9.
+  // The workload adds one compute boundary and a complete fan-out tree.
+  if (!profile) return 9;
+  let structureNodes = 0;
+  let nodesAtDepth = 1;
+  for (let depth = 1; depth <= profile.structural.boundaryDepth; depth += 1) {
+    structureNodes += nodesAtDepth;
+    nodesAtDepth *= profile.structural.fanOut;
+  }
+  return 9 + 1 + structureNodes;
+}
 const tracer = tracingMode === "conventional" && role !== "trace-collector"
   ? new ConventionalTracer(role, process.env.TRACE_COLLECTOR_URL ?? "http://localhost:4318")
   : undefined;
@@ -146,6 +159,7 @@ if (role === "trace-event-queue") {
       if (hasExplicitWorkload && (!request.query.compute || !request.query.structure || !request.query.inputSize)) return reply.code(400).send({ error: "compute_structure_and_inputSize_must_be_provided_together" });
       if (request.query.profile && !profile) return reply.code(400).send({ error: "unknown_workload_profile" });
       if (hasExplicitWorkload && !profile) return reply.code(400).send({ error: "invalid_workload_parameters" });
+      setExpectedExecutionRecordCount(expectedExecutionRecords(profile));
       try {
         const trace = tracer && request.conventionalTrace
           ? { tracer, active: request.conventionalTrace }
