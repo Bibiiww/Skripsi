@@ -1,7 +1,7 @@
-import type { Availability, Product } from "../domain/types.js";
+import type { MatchingResult, Personalization } from "../domain/types.js";
 import type { ActiveServerTrace, ConventionalTracer } from "../tracing/conventional.js";
 import type { OtelActiveTrace, ConventionalOtelTracer } from "../tracing/conventional-otel.js";
-import { proposedTraceHeaders } from "../tracing/proposed.js";
+import { proposedTraceHeaders, withApplicationSpan } from "../tracing/proposed.js";
 
 export type ConventionalRequestTrace = { tracer: ConventionalTracer; active: ActiveServerTrace } | { tracer: ConventionalOtelTracer; active: OtelActiveTrace };
 
@@ -13,10 +13,9 @@ async function getJson<T>(url: string, operation: string, trace?: ConventionalRe
   return response.json() as Promise<T>;
 }
 
-export function fetchProduct(catalogUrl: string, productId: string, trace?: ConventionalRequestTrace): Promise<Product> {
-  return getJson<Product>(`${catalogUrl}/products/${encodeURIComponent(productId)}`, "GET catalog.product", trace);
-}
-
-export function fetchAvailability(inventoryUrl: string, productId: string, quantity: number, trace?: ConventionalRequestTrace): Promise<Availability> {
-  return getJson<Availability>(`${inventoryUrl}/availability/${encodeURIComponent(productId)}?quantity=${quantity}`, "GET inventory.availability", trace);
+/** The single inter-service boundary shared by OTel and proposed tracing. */
+export function fetchMatchingData(matchingUrl: string, productId: string, quantity: number, personalization: Personalization, trace?: ConventionalRequestTrace): Promise<MatchingResult> {
+  const url = `${matchingUrl}/matches/${encodeURIComponent(productId)}?quantity=${quantity}&segment=${encodeURIComponent(personalization.customerSegment)}`;
+  if (trace) return getJson<MatchingResult>(url, "personalization.rpc.matching", trace);
+  return withApplicationSpan("personalization.rpc.matching", "rpc", () => getJson<MatchingResult>(url, "personalization.rpc.matching"));
 }

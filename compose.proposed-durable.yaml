@@ -12,12 +12,9 @@ services:
     depends_on:
       trace-event-queue:
         condition: service_healthy
-  catalog:
+  matching:
     <<: *durable-service
-    volumes: [catalog-trace-wal:/var/lib/tracing]
-  inventory:
-    <<: *durable-service
-    volumes: [inventory-trace-wal:/var/lib/tracing]
+    volumes: [matching-trace-wal:/var/lib/tracing]
   trace-event-queue:
     build: .
     environment:
@@ -43,5 +40,4 @@ services:
         condition: service_healthy
 volumes:
   gateway-trace-wal:
-  catalog-trace-wal:
-  inventory-trace-wal:
+  matching-trace-wal:

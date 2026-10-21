@@ -13,5 +13,10 @@ ENV NODE_ENV=production
 COPY package.json pnpm-lock.yaml ./
 RUN npm install --global pnpm@11.19.0 && pnpm install --prod --frozen-lockfile --ignore-scripts
 COPY --from=build /app/dist ./dist
+# The benchmark harness runs in a separate, short-lived Compose container. It
+# needs only the descriptor files and the Node-only generator script; neither
+# is loaded by the request-serving application processes.
+COPY tools/load-generator.mjs ./tools/load-generator.mjs
+COPY workloads ./workloads
 EXPOSE 3000
 CMD ["node", "dist/server.js"]

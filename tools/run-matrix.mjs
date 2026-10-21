@@ -51,20 +51,32 @@ function bytes(text) {
   return Number(match[1]) * scale[match[2].toLowerCase()];
 }
 
-function resourceSummary(metrics, capacity) {
+function resourceSummary(metrics, capacity, scope = {}) {
   const samples = metrics?.samples ?? [];
-  const cpu = [];
-  const memory = [];
-  for (const sample of samples) {
-    cpu.push((sample.containers ?? []).reduce((total, container) => total + (Number.parseFloat(container.CPUPerc) || 0), 0));
-    memory.push((sample.containers ?? []).reduce((total, container) => total + (bytes(container.MemUsage) || 0), 0));
-  }
-  const cpuCapacityPercent = capacity?.cpuCores ? capacity.cpuCores * 100 : null;
-  const memoryCapacityBytes = capacity?.memoryBytes ?? null;
+  const summarize = (serviceNames) => {
+    const cpu = [];
+    const memory = [];
+    for (const sample of samples) {
+      const selected = (sample.containers ?? []).filter((container) => !serviceNames || serviceNames.includes(container.service));
+      cpu.push(selected.reduce((total, container) => total + (Number.parseFloat(container.CPUPerc) || 0), 0));
+      memory.push(selected.reduce((total, container) => total + (bytes(container.MemUsage) || 0), 0));
+    }
+    const cpuCapacityPercent = capacity?.cpuCores ? capacity.cpuCores * 100 : null;
+    const memoryCapacityBytes = capacity?.memoryBytes ?? null;
+    return {
+      samples: samples.length,
+      cpuPercent: { mean: average(cpu), max: max(cpu), capacity: cpuCapacityPercent, remainingMean: cpuCapacityPercent === null ? null : Math.max(0, cpuCapacityPercent - average(cpu)), remainingMin: cpuCapacityPercent === null ? null : Math.max(0, cpuCapacityPercent - max(cpu)) },
+      memoryBytes: { mean: average(memory), max: max(memory), capacity: memoryCapacityBytes, remainingMean: memoryCapacityBytes === null ? null : Math.max(0, memoryCapacityBytes - average(memory)), remainingMin: memoryCapacityBytes === null ? null : Math.max(0, memoryCapacityBytes - max(memory)) }
+    };
+  };
   return {
-    samples: samples.length,
-    cpuPercent: { mean: average(cpu), max: max(cpu), capacity: cpuCapacityPercent, remainingMean: cpuCapacityPercent === null ? null : Math.max(0, cpuCapacityPercent - average(cpu)), remainingMin: cpuCapacityPercent === null ? null : Math.max(0, cpuCapacityPercent - max(cpu)) },
-    memoryBytes: { mean: average(memory), max: max(memory), capacity: memoryCapacityBytes, remainingMean: memoryCapacityBytes === null ? null : Math.max(0, memoryCapacityBytes - average(memory)), remainingMin: memoryCapacityBytes === null ? null : Math.max(0, memoryCapacityBytes - max(memory)) }
+    /** Main request-serving application; excludes load generator and separate tracing containers. */
+    application: summarize(scope.applicationServices ?? ["gateway", "matching"]),
+    /** Separately deployed queue/worker or collector. Null when the condition has none. */
+    asyncTracing: (scope.asyncTracingServices ?? []).length ? summarize(scope.asyncTracingServices) : null,
+    /** Full Compose system-under-test total, still excluding the external load generator. */
+    systemUnderTest: summarize(null),
+    loadGeneratorIncluded: false
   };
 }
 
@@ -149,7 +161,7 @@ async function summarizeRun(runDirectory) {
     http,
     tracing,
     internal,
-    resources: resourceSummary(resources, manifest.hostCapacity),
+    resources: resourceSummary(resources, manifest.hostCapacity, manifest.resourceScope),
     runDirectory
   };
 }
@@ -162,7 +174,9 @@ function internalNumber(record, path) {
 function flatRecord(record) {
   const http = record.http ?? {};
   const tracing = record.tracing ?? {};
-  const resources = record.resources ?? { cpuPercent: {}, memoryBytes: {} };
+  const resources = record.resources?.systemUnderTest ?? { cpuPercent: {}, memoryBytes: {} };
+  const applicationResources = record.resources?.application ?? { cpuPercent: {}, memoryBytes: {} };
+  const asyncResources = record.resources?.asyncTracing;
   return {
     run_id: record.runId,
     condition: record.condition,
@@ -195,6 +209,11 @@ function flatRecord(record) {
     business_processing_missing_samples: http.businessProcessingMs?.missingSamples ?? null,
     queue_drop_rate_percent: toNumber(tracing.queueDropRatePercent),
     reconstruction_success_rate_percent: toNumber(tracing.reconstructionSuccessRatePercent),
+    tracing_unit_type: tracing.tracingUnits?.type ?? tracing.tracingUnit ?? null,
+    tracing_units_produced: tracing.tracingUnits?.produced ?? tracing.events?.produced ?? null,
+    tracing_units_accepted: tracing.tracingUnits?.accepted ?? tracing.events?.enqueued ?? null,
+    tracing_units_dropped: tracing.tracingUnits?.dropped ?? tracing.events?.dropped ?? null,
+    tracing_units_reconstructed: tracing.tracingUnits?.reconstructed ?? tracing.events?.reconstructed ?? null,
     events_produced: tracing.events?.produced ?? null,
     events_enqueued: tracing.events?.enqueued ?? null,
     events_dropped: tracing.events?.dropped ?? null,
@@ -209,13 +228,18 @@ function flatRecord(record) {
     memory_capacity_bytes: resources.memoryBytes.capacity ?? null,
     memory_remaining_mean_bytes: resources.memoryBytes.remainingMean ?? null,
     memory_remaining_min_bytes: resources.memoryBytes.remainingMin ?? null,
+    application_cpu_percent_mean: applicationResources.cpuPercent.mean ?? null,
+    application_memory_bytes_mean: applicationResources.memoryBytes.mean ?? null,
+    async_tracing_cpu_percent_mean: asyncResources?.cpuPercent.mean ?? null,
+    async_tracing_memory_bytes_mean: asyncResources?.memoryBytes.mean ?? null,
+    load_generator_resource_included: false,
     run_directory: record.runDirectory,
     error: record.error ?? null
   };
 }
 
 function primaryRecord(record) {
-  const http = record.http ?? {}; const resources = record.resources ?? { cpuPercent: {}, memoryBytes: {} };
+  const http = record.http ?? {}; const resources = record.resources?.application ?? { cpuPercent: {}, memoryBytes: {} }; const asyncResources = record.resources?.asyncTracing;
   return {
     run_id: record.runId, condition: record.condition, workload_id: record.descriptorId, descriptor_sha256: record.descriptorSha256,
     measurement_boundary: record.measurementBoundary?.version ?? "legacy-measurement-boundary-uncertain",
@@ -224,7 +248,12 @@ function primaryRecord(record) {
     business_latency_mean_ms: toNumber(http.businessProcessingMs?.mean), business_latency_p50_ms: toNumber(http.businessProcessingMs?.p50), business_latency_p95_ms: toNumber(http.businessProcessingMs?.p95), business_latency_p99_ms: toNumber(http.businessProcessingMs?.p99),
     cpu_mean_percent: resources.cpuPercent.mean ?? null, cpu_max_percent: resources.cpuPercent.max ?? null,
     memory_mean_mb: resources.memoryBytes.mean === null ? null : resources.memoryBytes.mean / 1024 ** 2,
-    memory_max_mb: resources.memoryBytes.max === null ? null : resources.memoryBytes.max / 1024 ** 2
+    memory_max_mb: resources.memoryBytes.max === null ? null : resources.memoryBytes.max / 1024 ** 2,
+    async_tracing_cpu_mean_percent: asyncResources?.cpuPercent.mean ?? null,
+    async_tracing_cpu_max_percent: asyncResources?.cpuPercent.max ?? null,
+    async_tracing_memory_mean_mb: asyncResources?.memoryBytes.mean == null ? null : asyncResources.memoryBytes.mean / 1024 ** 2,
+    async_tracing_memory_max_mb: asyncResources?.memoryBytes.max == null ? null : asyncResources.memoryBytes.max / 1024 ** 2,
+    load_generator_resource_included: false
   };
 }
 

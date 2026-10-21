@@ -4,7 +4,7 @@ export class ExecutionReconstructionStore {
   private readonly recordsByTrace = new Map<string, Map<string, ExecutionRecord>>();
   private readonly expectedRecords: number;
 
-  constructor(expectedRecords = Number(process.env.TRACE_EXPECTED_RECORDS_PER_SUCCESSFUL_TRACE ?? 9)) {
+  constructor(expectedRecords = Number(process.env.TRACE_EXPECTED_RECORDS_PER_SUCCESSFUL_TRACE ?? 7)) {
     this.expectedRecords = expectedRecords;
   }
 

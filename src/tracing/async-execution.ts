@@ -5,7 +5,8 @@ import { mkdir, open, rename, stat, unlink } from "node:fs/promises";
 import { createInterface } from "node:readline";
 import { dirname } from "node:path";
 
-export type TraceLayer = "handler" | "service" | "repository";
+/** Selected application boundaries shared by conventional and proposed modes. */
+export type TraceLayer = "controller" | "service" | "repository" | "rpc";
 export type ExecutionRecord = {
   recordId: string;
   traceId: string;
@@ -474,6 +475,6 @@ export async function runExecutionRequest<T>(
         return Number.isInteger(parsed) && parsed > 0 ? parsed : undefined;
       })(),
     },
-    () => withExecutionRecord(operation, "handler", execute),
+    () => withExecutionRecord(operation, "controller", execute),
   );
 }

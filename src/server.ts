@@ -1,11 +1,10 @@
 import Fastify from "fastify";
 import { performance } from "node:perf_hooks";
-import { getProduct } from "./catalog/service.js";
 import { buildQuote } from "./gateway/service.js";
-import { checkAvailability } from "./inventory/service.js";
+import { resolveMatchingData } from "./matching/service.js";
 import { createWorkloadProfile, getWorkloadProfile, type ComputationalSignature, type StructuralSignature } from "./workload/profiles.js";
 import { ConventionalTracer, type ActiveServerTrace, type TraceSpan } from "./tracing/conventional.js";
-import { ConventionalOtelTracer, type OtelActiveTrace } from "./tracing/conventional-otel.js";
+import { ConventionalOtelTracer, installConventionalOtelTracer, type OtelActiveTrace } from "./tracing/conventional-otel.js";
 import { currentProposedTraceId, runProposedRequest, setExpectedExecutionRecordCount, type TraceEvent } from "./tracing/proposed.js";
 import { BoundedEventQueue } from "./tracing/queue.js";
 import { ReconstructionStore } from "./tracing/reconstruction.js";
@@ -20,27 +19,20 @@ declare module "fastify" {
 
 const role = process.env.SERVICE_ROLE ?? "gateway";
 const port = Number(process.env.PORT ?? 3000);
-const catalogUrl = process.env.CATALOG_URL ?? "http://localhost:3001";
-const inventoryUrl = process.env.INVENTORY_URL ?? "http://localhost:3002";
+const matchingUrl = process.env.MATCHING_URL ?? "http://localhost:3001";
 const app = Fastify({ logger: true });
 const tracingMode = process.env.TRACING_MODE ?? "off";
+const controllerOperation = role === "gateway" ? "personalization.controller.quote" : role === "matching" ? "matching.controller.resolve" : undefined;
 
-function expectedExecutionRecords(profile: { structural: { boundaryDepth: number; fanOut: number } } | undefined): number {
-  // Handler/service/repository boundaries outside the controlled workload = 9.
-  // The workload adds one compute boundary and a complete fan-out tree.
-  if (!profile) return 9;
-  let structureNodes = 0;
-  let nodesAtDepth = 1;
-  for (let depth = 1; depth <= profile.structural.boundaryDepth; depth += 1) {
-    structureNodes += nodesAtDepth;
-    nodesAtDepth *= profile.structural.fanOut;
-  }
-  return 9 + 1 + structureNodes;
-}
+// A controller, service, repository, and RPC boundary in Server A; then a
+// controller, service, and repository in Server B. Workload cost is enclosed
+// by the service body and intentionally creates no additional trace unit.
+const EXPECTED_TRACE_BOUNDARIES = 7;
 const tracer = tracingMode === "conventional" && role !== "trace-collector"
   ? new ConventionalTracer(role, process.env.TRACE_COLLECTOR_URL ?? "http://localhost:4318")
   : undefined;
 const otelTracer = tracingMode === "conventional-otel" && role !== "trace-collector" ? new ConventionalOtelTracer(role, process.env.TRACE_COLLECTOR_URL ?? "http://localhost:4318") : undefined;
+installConventionalOtelTracer(otelTracer);
 
 if (tracer) {
   app.addHook("onRequest", async (request, reply) => {
@@ -52,7 +44,7 @@ if (tracer) {
   });
 }
 if (otelTracer) {
-  app.addHook("onRequest", async (request, reply) => { const active = otelTracer.beginServerSpan(request.headers, `${request.method} ${request.routeOptions.url}`); request.otelTrace = active; reply.header("x-trace-id", active.span.spanContext().traceId); });
+  app.addHook("onRequest", async (request, reply) => { const active = otelTracer.beginServerSpan(request.headers, controllerOperation ?? `${request.method} ${request.routeOptions.url}`); request.otelTrace = active; reply.header("x-trace-id", active.span.spanContext().traceId); });
   app.addHook("onResponse", async (request, reply) => { if (request.otelTrace) otelTracer.endServerSpan(request.otelTrace, reply.statusCode); });
 }
 app.get("/health", async () => ({ status: "ok", role }));
@@ -120,7 +112,7 @@ if (role === "trace-event-queue") {
   app.get("/v1/metrics", async () => {
     const started = performance.now(); const byTrace = new Map<string, TraceSpan[]>();
     for (const span of spans) byTrace.set(span.traceId, [...(byTrace.get(span.traceId) ?? []), span]);
-    const expected = Number(process.env.TRACE_EXPECTED_CONVENTIONAL_SPANS ?? 5);
+    const expected = Number(process.env.TRACE_EXPECTED_CONVENTIONAL_SPANS ?? EXPECTED_TRACE_BOUNDARIES);
     const completeTraces = [...byTrace.values()].filter((trace) => {
       const ids = new Set(trace.map((span) => span.spanId)); const roots = trace.filter((span) => span.parentSpanId === null);
       return trace.length === expected && roots.length === 1 && trace.every((span) => span.parentSpanId === null || ids.has(span.parentSpanId));
@@ -129,25 +121,20 @@ if (role === "trace-event-queue") {
     observeTiming("RECONSTRUCTION", "duration_ms", reconstructionDurationMs); increment("RECONSTRUCTION", "attempts", byTrace.size); increment("RECONSTRUCTION", "success", completeTraces); increment("RECONSTRUCTION", "failed", byTrace.size - completeTraces);
     return { spansCreated: spans.length, spansReceived: spans.length, spansProcessed: spans.length, observedTraces: byTrace.size, completeTraces, incompleteTraces: byTrace.size - completeTraces, expectedSpansPerSuccessfulTrace: expected, reconstructionDurationMs };
   });
-} else if (role === "catalog") {
-  app.get<{ Params: { productId: string } }>("/products/:productId", async (request, reply) => observeRequest("catalog.handler.getProduct", () => runProposedRequest(request.headers, "catalog.handler.getProduct", () => observeBusiness("handler", async () => {
-    const traceId = currentProposedTraceId(); if (traceId) reply.header("x-trace-id", traceId);
-    try { return await getProduct(request.params.productId); }
-    catch { return reply.code(404).send({ error: "product_not_found" }); }
-  }))));
-} else if (role === "inventory") {
-  app.get<{ Params: { productId: string }; Querystring: { quantity?: string } }>("/availability/:productId", async (request, reply) => {
-    return observeRequest("inventory.handler.checkAvailability", () => runProposedRequest(request.headers, "inventory.handler.checkAvailability", () => observeBusiness("handler", async () => {
+} else if (role === "matching") {
+  app.get<{ Params: { productId: string }; Querystring: { quantity?: string; segment?: "standard" | "priority" } }>("/matches/:productId", async (request, reply) => {
+    const execute = () => observeRequest("matching.controller.resolve", () => runProposedRequest(request.headers, "matching.controller.resolve", () => observeBusiness("handler", async () => {
       const traceId = currentProposedTraceId(); if (traceId) reply.header("x-trace-id", traceId);
       const quantity = Number(request.query.quantity);
       if (!Number.isInteger(quantity) || quantity < 1) return reply.code(400).send({ error: "quantity_must_be_a_positive_integer" });
-      try { return await checkAvailability(request.params.productId, quantity); }
+      try { return await resolveMatchingData(request.params.productId, quantity, { customerSegment: request.query.segment === "priority" ? "priority" : "standard" }); }
       catch { return reply.code(404).send({ error: "product_not_found" }); }
     })));
+    return request.otelTrace && otelTracer ? otelTracer.runWithActiveRequest(request.otelTrace, execute) : execute();
   });
 } else if (role === "gateway") {
   app.get<{ Querystring: { productId?: string; quantity?: string; profile?: string; compute?: ComputationalSignature; structure?: StructuralSignature; inputSize?: string } }>("/api/v1/quote", async (request, reply) => {
-    return observeRequest("gateway.handler.quote", () => runProposedRequest(request.headers, "gateway.handler.quote", () => observeBusiness("handler", async () => {
+    const execute = () => observeRequest("personalization.controller.quote", () => runProposedRequest(request.headers, "personalization.controller.quote", () => observeBusiness("handler", async () => {
       const traceId = currentProposedTraceId(); if (traceId) reply.header("x-trace-id", traceId);
       const productId = request.query.productId;
       const quantity = Number(request.query.quantity);
@@ -159,7 +146,7 @@ if (role === "trace-event-queue") {
       if (hasExplicitWorkload && (!request.query.compute || !request.query.structure || !request.query.inputSize)) return reply.code(400).send({ error: "compute_structure_and_inputSize_must_be_provided_together" });
       if (request.query.profile && !profile) return reply.code(400).send({ error: "unknown_workload_profile" });
       if (hasExplicitWorkload && !profile) return reply.code(400).send({ error: "invalid_workload_parameters" });
-      setExpectedExecutionRecordCount(expectedExecutionRecords(profile));
+      setExpectedExecutionRecordCount(EXPECTED_TRACE_BOUNDARIES);
       try {
         const trace = tracer && request.conventionalTrace
           ? { tracer, active: request.conventionalTrace }
@@ -171,7 +158,7 @@ if (role === "trace-event-queue") {
         // and client-to-gateway transfer, while retaining tracing overhead that
         // occurs inside the comparable business path for each condition.
         const businessStarted = performance.now();
-        const quote = await observeBusiness("service", () => buildQuote(catalogUrl, inventoryUrl, productId, quantity, profile, trace), true);
+        const quote = await observeBusiness("service", () => buildQuote(matchingUrl, productId, quantity, profile, trace), true);
         reply.header("x-business-processing-ms", (performance.now() - businessStarted).toFixed(3));
         return quote;
       } catch (error) {
@@ -179,6 +166,7 @@ if (role === "trace-event-queue") {
         return reply.code(message === "INSUFFICIENT_STOCK" ? 409 : 502).send({ error: message.toLowerCase() });
       }
     })));
+    return request.otelTrace && otelTracer ? otelTracer.runWithActiveRequest(request.otelTrace, execute) : execute();
   });
 } else {
   throw new Error(`Unsupported SERVICE_ROLE: ${role}`);

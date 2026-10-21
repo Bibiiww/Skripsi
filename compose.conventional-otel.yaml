@@ -6,8 +6,8 @@ services:
       TRACE_COLLECTOR_URL: http://trace-collector:3000
       OTEL_BSP_SCHEDULE_DELAY_MS: ${OTEL_BSP_SCHEDULE_DELAY_MS:-100}
       OTEL_BSP_MAX_EXPORT_BATCH_SIZE: ${OTEL_BSP_MAX_EXPORT_BATCH_SIZE:-256}
-  catalog: *otel-service
-  inventory: *otel-service
+      TRACE_EXPECTED_CONVENTIONAL_SPANS: 7
+  matching: *otel-service
   trace-collector:
     build: .
     environment:

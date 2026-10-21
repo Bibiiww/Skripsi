@@ -3,6 +3,8 @@ import { randomUUID } from "node:crypto";
 import { performance } from "node:perf_hooks";
 import { addRequestValue, increment, internalObservabilityEnabled, observeTiming } from "../observability/internal.js";
 import { addTraceAttribute as addExecutionTraceAttribute, addTraceEvent as addExecutionTraceEvent, currentExecutionTraceId, executionTraceHeaders, isAsyncExecutionTracing, runExecutionRequest, setExpectedExecutionRecordCount, withExecutionRecord } from "./async-execution.js";
+import type { TraceLayer } from "./async-execution.js";
+import { activeConventionalOtelTracer } from "./conventional-otel.js";
 
 export type ProposedTraceContext = { requestId: string; currentSpanId: string | null };
 export type TraceEvent = {
@@ -11,7 +13,7 @@ export type TraceEvent = {
   parent_span_id: string | null;
   event_type: "ENTRY" | "EXIT";
   function_name: string;
-  layer: "handler" | "service" | "repository";
+  layer: TraceLayer;
   service_name: string;
   start_timestamp: string | null;
   end_timestamp: string | null;
@@ -89,6 +91,18 @@ export async function withProposedSpan<T>(
   }); if (diagnostic) observeTiming("WRAPPER", "async_local_storage_run_ms", performance.now() - alsStarted); return result;
 }
 
+/** Shared selected-boundary wrapper. In OTel mode it creates an OTel span;
+ * in proposed modes it creates exactly one completion record. */
+export async function withApplicationSpan<T>(
+  functionName: string,
+  layer: TraceLayer,
+  execute: () => Promise<T>
+): Promise<T> {
+  const otel = activeConventionalOtelTracer();
+  if (otel) return otel.withBoundary(functionName, layer, execute);
+  return withProposedSpan(functionName, layer, execute);
+}
+
 export async function runProposedRequest<T>(
   headers: Record<string, string | string[] | undefined>,
   operation: string,
@@ -98,7 +112,7 @@ export async function runProposedRequest<T>(
   if (!enabled) return execute();
   const requestId = headerValue(headers["x-trace-id"]) ?? randomUUID();
   const parentSpanId = headerValue(headers["x-parent-span-id"]) ?? null;
-  return storage.run({ requestId, currentSpanId: parentSpanId }, () => withProposedSpan(operation, "handler", execute));
+  return storage.run({ requestId, currentSpanId: parentSpanId }, () => withProposedSpan(operation, "controller", execute));
 }
 
 /** Optional application-level enrichment; it follows the same async record path. */

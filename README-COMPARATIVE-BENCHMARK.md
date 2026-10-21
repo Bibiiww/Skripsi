@@ -9,11 +9,51 @@ Panduan ini menghasilkan dataset baru yang dapat dibandingkan secara adil untuk 
 | C2 | `proposed-memory` | Satu execution record per boundary, buffer RAM bounded, batch asynchronous. |
 | C3 | `proposed-durable` | Kontrak record C2 dengan WAL local dan asynchronous group commit. |
 
+## Topologi dan boundary trace yang dibandingkan
+
+Kondisi C1--C3 memakai topologi bisnis yang sama. Server A (`gateway`) memuat
+personalisasi lokal, lalu memanggil Server B (`matching`) dengan context trace
+yang dipropagasikan. Load generator berada di luar aplikasi dan bukan node
+trace maupun resource System Under Test.
+
+```text
+client/load-generator
+  -> personalization.controller.quote
+  -> personalization.service.buildQuote
+     -> personalization.repository.loadPersonalization
+     -> personalization.rpc.matching
+        -> matching.controller.resolve
+        -> matching.service.resolve
+           -> matching.repository.findMatchingData
+```
+
+Tujuh boundary tersebut adalah kontrak trace tetap per request sukses. OTel
+menyimpannya sebagai span, sedangkan C2/C3 menyimpannya sebagai satu execution
+record per boundary. Komputasi workload tetap dilakukan di dalam service A,
+tetapi tidak menjadi node trace tambahan.
+
+`analysis.csv` juga menyediakan `tracing_unit_type` dan `tracing_units_*`.
+Gunakan field ini saat membahas volume pipeline: span dan execution record
+berbeda format, sehingga `events_produced` lama hanya dipertahankan untuk
+kompatibilitas dan bukan istilah perbandingan utama.
+
 ## Prinsip fairness
 
 Satu dataset perbandingan hanya valid bila seluruh condition memakai workstation dan alokasi resource Docker yang sama, commit source code yang sama, workload descriptor/RPS/duration/warm-up/endpoint yang sama, jumlah repetition yang sama, serta `--measurement-mode primary`.
 
 Jangan menjalankan condition secara manual lalu menggabungkan folder run secara acak. Matrix runner menyalakan dan mematikan stack pada setiap workload dan repetition agar state antar-run tidak terbawa.
+
+### Pemisahan load generator dan resource
+
+Mulai skema ini, load generator dijalankan sebagai **container one-shot terpisah** pada jaringan Docker yang sama. Container tersebut tidak masuk ke daftar container System Under Test dan tidak pernah dihitung pada CPU/memory utama. Ia hanya menghasilkan request dan mengukur waktu dari pengiriman request sampai response diterima.
+
+`primary/resource.csv` dan `observability/resource-separation.json` memisahkan tiga scope:
+
+- `application_request_path`: Server A (`gateway`/Personalization) dan Server B (`matching`); mencakup tracing yang memang terjadi sinkron di jalur request.
+- `async_tracing`: collector untuk C1 atau queue + reconstruction worker untuk C2/C3.
+- `system_under_test`: gabungan dua scope di atas, tetap tanpa load generator.
+
+Container terpisah menghilangkan pencampuran metric, tetapi masih berbagi CPU/RAM host Docker. Untuk isolasi fisik penuh, jalankan generator dari mesin kedua menuju URL gateway dan gunakan `--load-generator-mode host --base-url <URL-gateway>` pada runner yang berada di mesin generator.
 
 ## 1. Persiapan
 
@@ -86,10 +126,9 @@ pengukuran. Jalankan ulang setelah source ini diperbarui.
 
 Untuk C2/C3, `reconstruction_success_rate_percent` kini memakai trace lengkap:
 tepat satu root, seluruh parent invocation ada, tidak ada siklus, root sukses,
-dan jumlah execution record sesuai kontrak boundary workload yang dipropagasikan
-bersama trace context. Kontrak ini workload-specific: `o1-shallow-low` menghasilkan
-11 record, sedangkan bentuk moderate dan complex memiliki jumlah boundary lebih besar.
-Nilai ini tidak lagi sekadar menunjukkan bahwa sebuah root trace pernah tiba.
+dan tepat tujuh execution record sesuai kontrak boundary yang dipropagasikan
+bersama trace context. Nilai ini tidak lagi sekadar menunjukkan bahwa sebuah
+root trace pernah tiba.
 
 Hasil yang dibuat sebelum kontrak record ini tersedia adalah
 `legacy / measurement-boundary-uncertain` untuk reconstruction success rate.

@@ -22,9 +22,40 @@ function containerIds(project, composeFiles) {
   return ids;
 }
 
-function dockerStats(ids) {
+function containerServiceMap(ids) {
+  return Object.fromEntries(ids.map((id) => [id, run("docker", ["inspect", "--format", "{{index .Config.Labels \"com.docker.compose.service\"}}", id]) || id]));
+}
+
+function dockerStats(ids, servicesById) {
   const output = run("docker", ["stats", "--no-stream", "--format", "{{json .}}", ...ids]);
-  return output.split(/\r?\n/).filter(Boolean).map((line) => JSON.parse(line));
+  return output.split(/\r?\n/).filter(Boolean).map((line) => {
+    const stat = JSON.parse(line);
+    const id = ids.find((candidate) => candidate.startsWith(stat.Container) || stat.Container.startsWith(candidate.slice(0, 12)));
+    return { ...stat, service: id ? servicesById[id] : "unknown" };
+  });
+}
+
+function memoryBytes(text) {
+  const match = /([0-9.]+)\s*(B|KiB|MiB|GiB|TiB)/i.exec(text ?? "");
+  if (!match) return 0;
+  return Number(match[1]) * ({ b: 1, kib: 1024, mib: 1024 ** 2, gib: 1024 ** 3, tib: 1024 ** 4 })[match[2].toLowerCase()];
+}
+
+function percentile(values, fraction) {
+  const ordered = [...values].sort((left, right) => left - right);
+  return ordered.length ? ordered[Math.min(ordered.length - 1, Math.ceil(ordered.length * fraction) - 1)] : null;
+}
+
+function summarizeResourceScope(samples, serviceNames) {
+  const cpu = [];
+  const memory = [];
+  for (const sample of samples) {
+    const selected = sample.containers.filter((container) => serviceNames === null || serviceNames.includes(container.service));
+    cpu.push(selected.reduce((total, container) => total + (Number.parseFloat(container.CPUPerc) || 0), 0));
+    memory.push(selected.reduce((total, container) => total + memoryBytes(container.MemUsage), 0));
+  }
+  const summarize = (values) => ({ samples: values.length, mean: values.length ? values.reduce((total, value) => total + value, 0) / values.length : null, p95: percentile(values, 0.95), max: values.length ? Math.max(...values) : null });
+  return { cpu_percent: summarize(cpu), memory_bytes: summarize(memory) };
 }
 
 function dockerHostCapacity() {
@@ -111,8 +142,11 @@ const reconstructionMetricsUrl = option("--reconstruction-metrics-url", "http://
 const traceDrainTimeoutSeconds = Number(option("--trace-drain-timeout-seconds", "30"));
 const saturationThresholdPercent = Number(option("--saturation-threshold-percent", "95"));
 const internalObservability = option("--internal-observability", process.env.INTERNAL_OBSERVABILITY ?? "false") === "true";
+const loadGeneratorMode = option("--load-generator-mode", "container");
+const loadGeneratorBaseUrl = option("--load-generator-base-url", "http://gateway:3000");
 if (!descriptorPath || !condition) throw new Error("Usage: node tools/run-experiment.mjs --descriptor FILE --condition baseline|conventional|proposed|proposed-memory|proposed-durable [--base-url URL]");
 if (!["baseline", "conventional", "conventional-otel", "proposed", "proposed-memory", "proposed-durable"].includes(condition)) throw new Error("unsupported condition");
+if (!["container", "host"].includes(loadGeneratorMode)) throw new Error("--load-generator-mode must be container or host.");
 if (!Number.isFinite(saturationThresholdPercent) || saturationThresholdPercent <= 0 || saturationThresholdPercent > 100) throw new Error("--saturation-threshold-percent must be greater than 0 and at most 100.");
 const recordMode = condition === "proposed-memory" || condition === "proposed-durable";
 const selectedQueueMetricsUrl = recordMode ? queueMetricsUrl.replace(/\/v1\/metrics$/, "/v2/metrics") : queueMetricsUrl;
@@ -137,17 +171,28 @@ const composeFiles = condition === "conventional"
   : condition === "proposed-durable" ? ["compose.yaml", "compose.proposed-durable.yaml"]
     : ["compose.yaml"];
 const ids = containerIds(project, composeFiles);
+const servicesById = containerServiceMap(ids);
 const hostCapacity = dockerHostCapacity();
+const resourceScope = {
+  loadGenerator: { included: false, executionMode: loadGeneratorMode, reason: "separate test-harness container or host process; records request outcomes but is not part of the system under test" },
+  applicationServices: ["gateway", "matching"],
+  asyncTracingServices: condition === "conventional" || condition === "conventional-otel"
+    ? ["trace-collector"]
+    : condition === "proposed" || recordMode
+      ? ["trace-event-queue", "trace-reconstruction-worker"]
+      : [],
+  note: "Application totals include synchronous tracing work that executes in the request process. Async tracing totals contain only separately deployed tracing services."
+};
 const manifest = {
   schemaVersion: "2.0.0", runId, condition, status: "running", startedAt: new Date().toISOString(),
   descriptorId: descriptor.id, descriptorSha256: createHash("sha256").update(descriptorText).digest("hex"),
-  baseUrl, composeProject: project, composeFiles, containers: ids, hostCapacity, internalObservability, command: process.argv.slice(2),
+  baseUrl, composeProject: project, composeFiles, containers: ids, containerServices: servicesById, hostCapacity, resourceScope, internalObservability, command: process.argv.slice(2),
   measurementBoundary: {
-    version: "gateway-business-boundary-v1",
+    version: "two-service-function-boundary-v2",
     requestLatency: "load-generator schedules request to complete HTTP response receipt",
-    businessLatency: "gateway immediately before buildQuote invocation to buildQuote resolution; includes all work that actually executes on this request critical path",
+    businessLatency: "Server A immediately before personalization.service.buildQuote invocation to resolution; includes the required synchronous Server B call and workload computation, but excludes the external load generator",
     conventionalExport: "gateway-to-service client export is inside businessLatency; server-span export executes in Fastify onResponse after businessLatency and remains included in external requestLatency",
-    proposedInstrumentation: "wrapper context/UUID/timestamp/event construction/JSON serialization/fetch initiation execute on request critical path when reached; detached transport completion, queue, worker, and reconstruction are outside businessLatency",
+    proposedInstrumentation: "selected controller/service/repository/RPC boundary capture executes on the request critical path when reached; detached transport completion, queue, worker, and reconstruction are outside businessLatency",
     asynchronousObservability: "post-submission queue admission/worker/reconstruction, reported separately and never added to businessLatency"
   },
   measurementClassification: {
@@ -158,13 +203,30 @@ const manifest = {
 };
 await writeFile(join(runDir, "manifest.json"), `${JSON.stringify(manifest, null, 2)}\n`);
 
+const containerDescriptorPath = `workloads/v1/${descriptorAbsolutePath.split(/[\\/]/).at(-1)}`;
+const containerResultPath = `/results/${runId}/http-summary.json`;
+async function runLoadGenerator({ warmup, output } = {}) {
+  const args = ["tools/load-generator.mjs", "--descriptor", containerDescriptorPath, "--base-url", loadGeneratorMode === "container" ? loadGeneratorBaseUrl : baseUrl];
+  if (!warmup) args.push("--skip-warmup");
+  if (output) args.push("--output", loadGeneratorMode === "container" ? containerResultPath : output);
+  if (loadGeneratorMode === "container") {
+    // Bind the exact caller-selected results directory. This keeps the
+    // one-shot harness container separate while preserving custom --results-dir
+    // paths used by the matrix runner.
+    run("docker", ["compose", "-p", project, ...composeFiles.flatMap((file) => ["-f", file]), "run", "--rm", "--no-deps", "--volume", `${resultsDir}:/results`, "load-generator", "node", ...args]);
+    return;
+  }
+  const child = spawn(process.execPath, args.map((value) => value === containerDescriptorPath ? descriptorAbsolutePath : value), { stdio: "inherit" });
+  await waitForChild(child);
+}
+
 const samples = [];
 let samplingError = null;
 let sampling = false;
 const sample = () => {
   if (sampling) return;
   sampling = true;
-  try { samples.push({ capturedAt: new Date().toISOString(), containers: dockerStats(ids) }); }
+  try { samples.push({ capturedAt: new Date().toISOString(), containers: dockerStats(ids, servicesById) }); }
   catch (error) { samplingError = error instanceof Error ? error.message : String(error); }
   finally { sampling = false; }
 };
@@ -173,8 +235,7 @@ const timer = setInterval(sample, 1000);
 try {
   // Warm-up is deliberately outside the measurement window. This makes every
   // tracing metric below a per-measurement delta rather than a cumulative value.
-  const warmupChild = spawn(process.execPath, ["tools/load-generator.mjs", "--descriptor", descriptorAbsolutePath, "--base-url", baseUrl], { stdio: "inherit" });
-  await waitForChild(warmupChild);
+  await runLoadGenerator({ warmup: true });
 
   let proposedBefore;
   let conventionalBefore;
@@ -201,8 +262,7 @@ try {
   manifest.diagnosticModeVerified = gatewayDiagnosticState.enabled;
   if (internalObservability) { await resetInternal(internalUrls); resetContainerInternalMetrics(ids); }
 
-  const child = spawn(process.execPath, ["tools/load-generator.mjs", "--descriptor", descriptorAbsolutePath, "--base-url", baseUrl, "--skip-warmup", "--output", join(runDir, "http-summary.json")], { stdio: "inherit" });
-  await waitForChild(child);
+  await runLoadGenerator({ warmup: false, output: join(runDir, "http-summary.json") });
   const http = JSON.parse(await readFile(join(runDir, "http-summary.json"), "utf8"));
   const primaryPerformance = { schemaVersion: "1.1.0", measurementBoundary: manifest.measurementBoundary.version, condition, workload_id: descriptor.id, run_id: runId, achieved_rps: http.achievedRps, successful_throughput_rps: http.successfulThroughputRps, successful_requests: http.successfulRequests, request_latency_ms: http.latencyMs, business_latency_ms: http.businessProcessingMs };
   await writeFile(join(runDir, "latency.json"), `${JSON.stringify(primaryPerformance, null, 2)}\n`);
@@ -232,6 +292,7 @@ try {
       schemaVersion: "1.1.0", capturedAt: new Date().toISOString(), drained: drain.drained,
       measurementOnly: true, expectedRequests,
       events: { produced: eventsProduced, enqueued: queue.accepted, dropped: queue.dropped, reconstructed: recordMode ? reconstruction.reconstructedSpans : reconstruction.events },
+      tracingUnits: { type: recordMode ? "execution_record" : "event", produced: eventsProduced, accepted: queue.accepted, dropped: queue.dropped, reconstructed: recordMode ? reconstruction.reconstructedSpans : reconstruction.events },
       queue, reconstruction,
       queueDropRatePercent: eventsProduced ? (queue.dropped / eventsProduced) * 100 : null,
       reconstructionSuccessRatePercent: expectedRequests ? (reconstruction.completeTraces / expectedRequests) * 100 : null,
@@ -255,7 +316,7 @@ try {
       reconstructionDurationMs: collectorTotal.reconstructionDurationMs
     };
     conventionalMeasurement = collector;
-    const metrics = { schemaVersion: "1.3.0", capturedAt: new Date().toISOString(), measurementOnly: true, expectedRequests: http.successfulRequests, tracingUnit: "span", events: { produced: collector.spansCreated, enqueued: collector.spansReceived, dropped: null, reconstructed: collector.spansProcessed }, reconstruction: collector, queueDropRatePercent: null, reconstructionSuccessRatePercent: http.successfulRequests ? (collector.completeTraces / http.successfulRequests) * 100 : null };
+    const metrics = { schemaVersion: "1.4.0", capturedAt: new Date().toISOString(), measurementOnly: true, expectedRequests: http.successfulRequests, tracingUnit: "span", events: { produced: collector.spansCreated, enqueued: collector.spansReceived, dropped: null, reconstructed: collector.spansProcessed }, tracingUnits: { type: "span", produced: collector.spansCreated, accepted: collector.spansReceived, dropped: null, reconstructed: collector.spansProcessed }, reconstruction: collector, queueDropRatePercent: null, reconstructionSuccessRatePercent: http.successfulRequests ? (collector.completeTraces / http.successfulRequests) * 100 : null };
     await writeFile(join(runDir, "tracing-metrics.json"), `${JSON.stringify(metrics, null, 2)}\n`);
   }
   if (condition === "conventional" || condition === "conventional-otel" || condition === "proposed" || recordMode) {
@@ -271,7 +332,7 @@ try {
     const collector = services.collector;
     const queueMetrics = condition === "proposed" || recordMode ? await json(selectedQueueMetricsUrl) : null;
     const collectorMetrics = condition === "conventional" || condition === "conventional-otel" ? conventionalMeasurement ?? await json("http://127.0.0.1:16686/v1/metrics") : null;
-    const applicationServices = Object.fromEntries(Object.entries(services).filter(([name]) => ["gateway", "catalog", "inventory"].includes(name)));
+    const applicationServices = Object.fromEntries(Object.entries(services).filter(([name]) => ["gateway", "matching"].includes(name)));
     const eventsProduced = sumCounter(applicationServices, "EVENT_CAPTURE.events_produced");
     const submitted = sumCounter(applicationServices, "EVENT_SUBMISSION.initiated");
     const enqueued = counter(queueService, "QUEUE.enqueue_success");
@@ -327,7 +388,13 @@ try {
   sample();
   manifest.finishedAt = new Date().toISOString();
   manifest.resourceSamplingError = samplingError;
-  const resourceArtifact = { schemaVersion: "1.0.0", intervalSeconds: 1, samples };
+  const resourceSeparation = {
+    application_request_path: summarizeResourceScope(samples, resourceScope.applicationServices),
+    async_tracing: resourceScope.asyncTracingServices.length ? summarizeResourceScope(samples, resourceScope.asyncTracingServices) : null,
+    system_under_test: summarizeResourceScope(samples, null),
+    load_generator: { included_in_any_scope: false, execution_mode: loadGeneratorMode }
+  };
+  const resourceArtifact = { schemaVersion: "2.1.0", intervalSeconds: 1, scope: resourceScope, separation: resourceSeparation, samples };
   const primaryMetricsComplete = Boolean(manifest.measurementValidation?.primaryMetricsComplete);
   const resourceMetricsComplete = samples.length >= 2 && !samplingError;
   if (manifest.measurementValidation) {
@@ -343,7 +410,8 @@ try {
   await writeFile(join(runDir, "container-metrics.json"), `${JSON.stringify(resourceArtifact, null, 2)}\n`);
   await writeFile(join(runDir, "resource.json"), `${JSON.stringify(resourceArtifact, null, 2)}\n`);
   await writeFile(join(runDir, "primary", "resource.json"), `${JSON.stringify(resourceArtifact, null, 2)}\n`);
-  await writeFile(join(runDir, "primary", "resource.csv"), `run_id,condition,resource_sample_count,resource_sampling_error\n${runId},${condition},${samples.length},${samplingError ? JSON.stringify(samplingError) : ""}\n`);
+  await writeFile(join(runDir, "observability", "resource-separation.json"), `${JSON.stringify(resourceSeparation, null, 2)}\n`);
+  await writeFile(join(runDir, "primary", "resource.csv"), `run_id,condition,resource_sample_count,resource_sampling_error,load_generator_included,load_generator_execution_mode,application_services,application_cpu_mean_percent,application_cpu_p95_percent,application_cpu_max_percent,application_memory_mean_bytes,application_memory_p95_bytes,application_memory_max_bytes,async_tracing_services,async_tracing_cpu_mean_percent,async_tracing_cpu_p95_percent,async_tracing_cpu_max_percent,async_tracing_memory_mean_bytes,async_tracing_memory_p95_bytes,async_tracing_memory_max_bytes\n${runId},${condition},${samples.length},${samplingError ? JSON.stringify(samplingError) : ""},false,${loadGeneratorMode},"${resourceScope.applicationServices.join("|")}",${resourceSeparation.application_request_path.cpu_percent.mean},${resourceSeparation.application_request_path.cpu_percent.p95},${resourceSeparation.application_request_path.cpu_percent.max},${resourceSeparation.application_request_path.memory_bytes.mean},${resourceSeparation.application_request_path.memory_bytes.p95},${resourceSeparation.application_request_path.memory_bytes.max},"${resourceScope.asyncTracingServices.join("|")}",${resourceSeparation.async_tracing?.cpu_percent.mean ?? ""},${resourceSeparation.async_tracing?.cpu_percent.p95 ?? ""},${resourceSeparation.async_tracing?.cpu_percent.max ?? ""},${resourceSeparation.async_tracing?.memory_bytes.mean ?? ""},${resourceSeparation.async_tracing?.memory_bytes.p95 ?? ""},${resourceSeparation.async_tracing?.memory_bytes.max ?? ""}\n`);
   await writeFile(join(runDir, "manifest.json"), `${JSON.stringify(manifest, null, 2)}\n`);
 }
 console.log(`Experiment complete: ${runDir}`);

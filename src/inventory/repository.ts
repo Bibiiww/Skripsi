@@ -1,4 +1,4 @@
-import { withProposedSpan } from "../tracing/proposed.js";
+import { withApplicationSpan } from "../tracing/proposed.js";
 import { observeBusiness } from "../observability/internal.js";
 
 const stockByProduct: Record<string, number> = {
@@ -8,5 +8,5 @@ const stockByProduct: Record<string, number> = {
 };
 
 export async function readStock(productId: string): Promise<number | undefined> {
-  return observeBusiness("repository", () => withProposedSpan("inventory.repository.readStock", "repository", async () => stockByProduct[productId]));
+  return observeBusiness("repository", () => withApplicationSpan("inventory.repository.readStock", "repository", async () => stockByProduct[productId]));
 }

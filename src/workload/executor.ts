@@ -1,5 +1,4 @@
 import type { WorkloadProfile } from "./profiles.js";
-import { withProposedSpan } from "../tracing/proposed.js";
 
 export type WorkloadExecution = { profileId: string; checksum: number; structuralSteps: number };
 
@@ -29,29 +28,28 @@ function executeCompute(profile: WorkloadProfile): number {
   return linearCost(inputSize, logarithmicCost(inputSize, inputSize));
 }
 
-// These named boundaries deliberately create deterministic internal call shapes.
-// Future wrapper instrumentation will observe these functions, not utility calls.
+// These functions deliberately create deterministic workload cost, but they are
+// not application boundaries. They must remain inside the service duration while
+// staying outside the selected tracing topology.
 function shallowBoundary(checksum: number): number { return constantCost(checksum); }
 function moderateBoundary(checksum: number): number { return shallowBoundary(constantCost(checksum)); }
 function complexBoundary(checksum: number): number { return moderateBoundary(shallowBoundary(constantCost(checksum))); }
 
 async function executeStructureNode(profile: WorkloadProfile, depth: number, checksum: number): Promise<{ checksum: number; steps: number }> {
-  return withProposedSpan(`gateway.service.workload.${profile.structural.signature}.depth${depth}`, "service", async () => {
-    const boundary = profile.structural.signature === "shallow" ? shallowBoundary : profile.structural.signature === "moderate" ? moderateBoundary : complexBoundary;
-    let result = boundary(checksum);
-    let steps = 1;
-    if (depth < profile.structural.boundaryDepth) {
-      for (let branch = 0; branch < profile.structural.fanOut; branch += 1) {
-        const child = await executeStructureNode(profile, depth + 1, result + branch);
-        result = child.checksum; steps += child.steps;
-      }
+  const boundary = profile.structural.signature === "shallow" ? shallowBoundary : profile.structural.signature === "moderate" ? moderateBoundary : complexBoundary;
+  let result = boundary(checksum);
+  let steps = 1;
+  if (depth < profile.structural.boundaryDepth) {
+    for (let branch = 0; branch < profile.structural.fanOut; branch += 1) {
+      const child = await executeStructureNode(profile, depth + 1, result + branch);
+      result = child.checksum; steps += child.steps;
     }
-    return { checksum: result, steps };
-  });
+  }
+  return { checksum: result, steps };
 }
 
 export async function executeControlledWorkload(profile: WorkloadProfile): Promise<WorkloadExecution> {
-  const computed = await withProposedSpan("gateway.service.workload.compute", "service", async () => executeCompute(profile));
+  const computed = executeCompute(profile);
   const structured = await executeStructureNode(profile, 1, computed);
   return { profileId: profile.id, checksum: structured.checksum, structuralSteps: structured.steps };
 }

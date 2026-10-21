@@ -11,6 +11,11 @@ export type Availability = {
   remaining: number;
 };
 
+/** Synthetic and non-sensitive input carried from Server A to Server B. */
+export type Personalization = { customerSegment: "standard" | "priority" };
+
+export type MatchingResult = { product: Product; availability: Availability };
+
 export type Quote = {
   product: Product;
   availability: Availability;

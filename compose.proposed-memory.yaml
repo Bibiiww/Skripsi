@@ -11,8 +11,7 @@ services:
     depends_on:
       trace-event-queue:
         condition: service_healthy
-  catalog: *memory-service
-  inventory: *memory-service
+  matching: *memory-service
   trace-event-queue:
     build: .
     environment:
