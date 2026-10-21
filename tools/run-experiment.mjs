@@ -177,10 +177,19 @@ try {
   await waitForChild(warmupChild);
 
   let proposedBefore;
+  let conventionalBefore;
+  let conventionalMeasurement;
   if (condition === "proposed" || recordMode) {
     const settled = await waitForProposedDrain(selectedQueueMetricsUrl, selectedReconstructionMetricsUrl, traceDrainTimeoutSeconds);
     if (!settled.drained) throw new Error("Could not drain proposed tracing events after warm-up; measurement was not started.");
     proposedBefore = { queue: settled.queue, reconstruction: settled.reconstruction };
+  }
+  if (condition === "conventional" || condition === "conventional-otel") {
+    // The BatchSpanProcessor also exports spans produced during warm-up. Wait
+    // for that export, then snapshot it so every reported collector value is
+    // a measurement-only delta with the same boundary as the HTTP summary.
+    await sleep(1000);
+    conventionalBefore = await json("http://127.0.0.1:16686/v1/metrics");
   }
   const internalUrls = condition === "proposed" || recordMode
     ? { gateway: `${baseUrl}/v1/internal-observability`, queue: "http://127.0.0.1:16686/v1/internal-observability", worker: "http://127.0.0.1:16687/v1/internal-observability" }
@@ -239,8 +248,14 @@ try {
     // Server spans are exported from Fastify's onResponse hook; let the final
     // hook/export complete before taking the collector snapshot and diagram.
     await sleep(1000);
-    const collector = await json("http://127.0.0.1:16686/v1/metrics");
-    const metrics = { schemaVersion: "1.2.0", capturedAt: new Date().toISOString(), measurementOnly: true, expectedRequests: http.successfulRequests, tracingUnit: "span", events: { produced: collector.spansCreated, enqueued: collector.spansReceived, dropped: null, reconstructed: collector.spansProcessed }, reconstruction: collector, queueDropRatePercent: null, reconstructionSuccessRatePercent: http.successfulRequests ? (collector.completeTraces / http.successfulRequests) * 100 : null };
+    const collectorTotal = await json("http://127.0.0.1:16686/v1/metrics");
+    const collector = {
+      ...delta(collectorTotal, conventionalBefore, ["spansCreated", "spansReceived", "spansProcessed", "observedTraces", "completeTraces", "incompleteTraces"]),
+      expectedSpansPerSuccessfulTrace: collectorTotal.expectedSpansPerSuccessfulTrace,
+      reconstructionDurationMs: collectorTotal.reconstructionDurationMs
+    };
+    conventionalMeasurement = collector;
+    const metrics = { schemaVersion: "1.3.0", capturedAt: new Date().toISOString(), measurementOnly: true, expectedRequests: http.successfulRequests, tracingUnit: "span", events: { produced: collector.spansCreated, enqueued: collector.spansReceived, dropped: null, reconstructed: collector.spansProcessed }, reconstruction: collector, queueDropRatePercent: null, reconstructionSuccessRatePercent: http.successfulRequests ? (collector.completeTraces / http.successfulRequests) * 100 : null };
     await writeFile(join(runDir, "tracing-metrics.json"), `${JSON.stringify(metrics, null, 2)}\n`);
   }
   if (condition === "conventional" || condition === "conventional-otel" || condition === "proposed" || recordMode) {
@@ -255,7 +270,7 @@ try {
     const worker = services.worker;
     const collector = services.collector;
     const queueMetrics = condition === "proposed" || recordMode ? await json(selectedQueueMetricsUrl) : null;
-    const collectorMetrics = condition === "conventional" || condition === "conventional-otel" ? await json("http://127.0.0.1:16686/v1/metrics") : null;
+    const collectorMetrics = condition === "conventional" || condition === "conventional-otel" ? conventionalMeasurement ?? await json("http://127.0.0.1:16686/v1/metrics") : null;
     const applicationServices = Object.fromEntries(Object.entries(services).filter(([name]) => ["gateway", "catalog", "inventory"].includes(name)));
     const eventsProduced = sumCounter(applicationServices, "EVENT_CAPTURE.events_produced");
     const submitted = sumCounter(applicationServices, "EVENT_SUBMISSION.initiated");

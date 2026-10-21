@@ -78,6 +78,12 @@ throughput menurut definisi proposal, gunakan `successful_throughput_rps`, yaitu
 response HTTP 2xx per detik pengukuran aktual. Field ini adalah basis yang tepat
 untuk menghitung throughput degradation ketika request gagal.
 
+Untuk `conventional-otel`, metrik collector (span dan reconstruction) adalah
+delta setelah warm-up selesai. Jangan gunakan dataset lama apabila
+`reconstruction_success_rate_percent` melebihi 100%; itu menandakan span warm-up
+masih berada di numerator collector sementara denominator hanya request fase
+pengukuran. Jalankan ulang setelah source ini diperbarui.
+
 Untuk C2/C3, `reconstruction_success_rate_percent` kini memakai trace lengkap:
 tepat satu root, seluruh parent invocation ada, tidak ada siklus, root sukses,
 dan jumlah execution record sesuai kontrak boundary workload yang dipropagasikan
